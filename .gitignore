@@ -1,0 +1,12 @@
+tokens
+.env
+*.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env311/
+outputs/org-pipeline-runs/
+logs/
+*.log
+.DS_Store

@@ -1,0 +1,1870 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+GitHub Pull Request Task-Profile Report
+================================================================================
+
+Classifies every merged pull request in a GitHub repository into one of four
+task profiles, using TWO independent methods and reporting them side by side:
+
+    1. Rules    - a deterministic rulebook (fast, consistent, transparent)
+    2. LLM      - a language model judging the same extracted signals (nuanced)
+
+Task profiles
+-------------
+    - simple_fix             : 1-2 files, no meaningful human discussion
+                               (config changes, dependency bumps, typo fixes)
+    - standard_feature_work  : 3-10 files, typically touches tests, normal review
+    - rich_task              : linked issue + substantive human review
+                               (most likely high-value human work)
+    - other                  : does not cleanly fit the above
+    - automated              : bot-authored PRs (set aside before counting)
+
+Targets (what to scan)
+----------------------
+    Any mix of the following can be passed; all are de-duplicated:
+    - a single repo            --repo owner/name
+    - multiple repos           --repo owner/a,owner/b   (or repeat --repo)
+    - every repo of an owner   --repo owner             (org OR user, auto-detected)
+    - every repo of an org     --org my-org             (repeatable / comma-separated)
+    - every repo of a user     --user my-handle         (repeatable / comma-separated)
+
+Deliverables (written to a per-run directory: <output-dir>/<run_id>/)
+--------------------------------------------------------------------
+    org_summary.csv           : one row per repo (LLM + rules task-profile percentages)
+    org_summary.json          : same repo-level data + org totals + metadata
+    <run_id>.log              : detailed run log (every repo, PR, API page, retry, failures)
+    failures.json             : written only when repos fail (fetch or classification errors)
+    <run_id>.zip              : archive of org_summary csv/json, log, and failures (if any)
+    combined_report.json      : metadata + combined summary + per-repo summaries + all PRs
+    combined_per_pr.csv       : every PR across all repos (with a repository column)
+    repos/<repo>.json         : per-repo full report
+    repos/<repo>.csv          : per-repo PR table
+
+Requirements
+------------
+    Python 3.9+
+    pip install requests openai python-dotenv
+
+Environment (loaded from .env automatically if present)
+-------------------------------------------------------
+    GITHUB_TOKEN     required  - classic or fine-grained token with repo read
+    OPENAI_API_KEY   required  - the LLM pass is part of the pipeline
+
+Examples
+--------
+    python3 pr_task_profile_report.py --repo data-tech/frontend
+    python3 pr_task_profile_report.py --repo owner/a,owner/b
+    python3 pr_task_profile_report.py --org data-tech --model gpt-4o
+    python3 pr_task_profile_report.py --user octocat --no-forks
+
+--------------------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import re
+import sys
+import time
+import zipfile
+import urllib.parse
+import urllib.parse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover - dotenv is optional
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata / constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+VERSION = "1.2.1"
+GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+GITHUB_REST_URL = "https://api.github.com"
+GITLAB_REST_URL = "https://gitlab.com/api/v4"
+DEFAULT_MODEL = "gpt-4o-mini"
+CATEGORIES = ["simple_fix", "standard_feature_work", "rich_task", "other"]
+
+logger = logging.getLogger("pr_task_profile")
+
+
+BOT_LOGINS = {
+    "dependabot",
+    "dependabot[bot]",
+    "renovate[bot]",
+    "github-actions[bot]",
+    "pre-commit-ci[bot]",
+    "semantic-release-bot",
+    "vercel[bot]",
+    "netlify[bot]",
+    "snyk-bot",
+    "snyk[bot]",
+    "codecov[bot]",
+    "deepsource-autofix[bot]",
+}
+
+TEST_PATH_HINTS = (
+    "/test/",
+    "/tests/",
+    "__tests__/",
+    ".spec.",
+    ".test.",
+    "test_",
+    "_test.",
+    "pytest",
+    "jest",
+    "cypress",
+)
+
+GENERATED_PATH_HINTS = (
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pipfile.lock",
+    "go.sum",
+    "go.mod",
+    "cargo.lock",
+    ".generated.",
+    ".pb.go",
+    ".pb.ts",
+    ".pb.js",
+    "/dist/",
+    "/build/",
+    "/vendor/",
+    "/generated/",
+    "schema.generated",
+)
+
+TRIVIAL_COMMENT_EXACT = {
+    "lgtm",
+    "looks good",
+    "approved",
+    "ship it",
+    "+1",
+    "thanks",
+    "done",
+    "fixed",
+    "nit",
+    "rebase",
+    "rebase please",
+    "please rebase",
+    "fix lint",
+}
+
+SUBSTANTIVE_TERMS = (
+    "because",
+    "edge case",
+    "race condition",
+    "security",
+    "latency",
+    "performance",
+    "rollback",
+    "migration",
+    "data loss",
+    "backward compatibility",
+    "test coverage",
+    "what happens",
+    "why",
+    "should we",
+    "can we avoid",
+    "null",
+    "concurrency",
+    "retry",
+    "timeout",
+    "api contract",
+    "breaking change",
+    "deadlock",
+    "transaction",
+    "idempotent",
+    "cache",
+    "scalability",
+    "memory",
+    "query plan",
+    "index",
+)
+
+LINKED_ISSUE_REGEX = re.compile(
+    r"\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+"
+    r"(([\w.-]+/[\w.-]+)?#\d+)",
+    re.IGNORECASE,
+)
+
+GRAPHQL_QUERY = """
+query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: MERGED,
+      first: $pageSize,
+      after: $cursor,
+      orderBy: {field: UPDATED_AT, direction: DESC}
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        bodyText
+        url
+        createdAt
+        mergedAt
+        changedFiles
+        additions
+        deletions
+        totalCommentsCount
+        author { login __typename }
+        labels(first: 20) { nodes { name } }
+        commits { totalCount }
+        files(first: 60) {
+          pageInfo { hasNextPage }
+          nodes { path }
+        }
+        closingIssuesReferences(first: 10) {
+          nodes { number title url }
+        }
+        comments(first: 25) {
+          pageInfo { hasNextPage }
+          nodes { bodyText createdAt author { login __typename } }
+        }
+        reviews(first: 25) {
+          pageInfo { hasNextPage }
+          nodes {
+            state
+            bodyText
+            createdAt
+            author { login __typename }
+          }
+        }
+        reviewThreads(first: 30) {
+          pageInfo { hasNextPage }
+          nodes {
+            isResolved
+            comments(first: 20) {
+              pageInfo { hasNextPage }
+              nodes { bodyText path createdAt author { login __typename } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+LLM_SYSTEM_PROMPT = """You classify merged GitHub pull requests into exactly one task profile.
+
+Categories (choose exactly one):
+- simple_fix: 1-2 files, no meaningful human discussion. Config changes, dependency
+  bumps, typo fixes, tiny mechanical edits.
+- standard_feature_work: 3-10 files, usually touches tests, may have a linked issue.
+  Normal implementation work without a deep design/review conversation.
+- rich_task: has a linked issue AND substantive human review (real back-and-forth
+  about correctness, edge cases, design, trade-offs). Most likely human-authored,
+  high-value work.
+- other: does not cleanly fit the three above (e.g. large mechanical/generated
+  changes, lockfile-heavy churn, or ambiguous PRs).
+
+Rules:
+- Judge using BOTH PR size and discussion richness. They are independent axes;
+  a small PR can still be a rich_task if there is a linked issue and substantive review.
+- "Substantive review" means review comments that discuss correctness, edge cases,
+  security, performance, design, or request real changes. "LGTM", "nit", "rebase",
+  "thanks" are NOT substantive.
+- Ignore bot accounts; they are pre-filtered out of the counts you receive.
+- Be conservative about rich_task: require a linked issue and genuinely substantive
+  discussion, not just a high comment count.
+
+Respond ONLY with strict JSON, no prose:
+{"category": "<one of simple_fix|standard_feature_work|rich_task|other>",
+ "confidence": "<high|medium|low>",
+ "reason": "<one short sentence>"}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def setup_logging(log_path: Path, verbose: bool) -> None:
+    """Console (INFO, or DEBUG if --verbose) + file (always DEBUG)."""
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler(stream=sys.stderr)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub fetch (with retry/backoff)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wait_for_rate_limit(response: requests.Response, attempt: int, default: int = 60) -> int:
+    reset = response.headers.get("X-RateLimit-Reset")
+    if reset and str(reset).isdigit():
+        wait = int(reset) - int(time.time()) + 5
+        return max(wait, 10)
+    retry_after = response.headers.get("Retry-After")
+    if retry_after and str(retry_after).isdigit():
+        return int(retry_after)
+    return min(2 ** attempt, default)
+
+
+def github_graphql(
+    token: str,
+    query: str,
+    variables: Dict[str, Any],
+    max_retries: int = 12,
+) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(
+                GITHUB_GRAPHQL_URL,
+                headers=headers,
+                json={"query": query, "variables": variables},
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            last_err = f"network error: {exc}"
+            logger.warning("GraphQL request failed (attempt %d/%d): %s", attempt, max_retries, exc)
+            time.sleep(min(2 ** attempt, 30))
+            continue
+
+        if response.status_code in (403, 429, 502, 503, 504):
+            retry_after = response.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 60)
+            last_err = f"transient HTTP {response.status_code}: {response.text[:200]}"
+            logger.warning(
+                "GitHub transient error (status %s). Waiting %ss (attempt %d/%d).",
+                response.status_code, wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code >= 400:
+            raise RuntimeError(f"GitHub API error: {response.status_code} {response.text}")
+
+        payload = response.json()
+        if "errors" in payload:
+            errors = payload["errors"]
+            if any(err.get("type") == "RATE_LIMITED" for err in errors):
+                wait = _wait_for_rate_limit(response, attempt)
+                last_err = f"GraphQL rate limited: {json.dumps(errors)[:200]}"
+                logger.warning(
+                    "GitHub GraphQL rate limit. Waiting %ss (attempt %d/%d).",
+                    wait, attempt, max_retries,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"GraphQL errors: {json.dumps(errors, indent=2)}")
+        return payload["data"]
+
+    raise RuntimeError(f"GitHub GraphQL failed after {max_retries} retries. Last error: {last_err}")
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def fetch_merged_prs(
+    token: str,
+    repo: str,
+    sleep_seconds: float,
+    checkpoint_dir: Optional[Path] = None,
+    page_size: int = 50,
+) -> List[Dict[str, Any]]:
+    if "/" not in repo:
+        raise ValueError("Repo must be in owner/name format, e.g. owner/repo")
+
+    owner, name = repo.split("/", 1)
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", repo)
+    jsonl_path = state_path = None
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = checkpoint_dir / f"{slug}_prs.jsonl"
+        state_path = checkpoint_dir / f"{slug}_fetch_state.json"
+
+    cursor: Optional[str] = None
+    page = 0
+    pr_count = 0
+    all_prs_mem: List[Dict[str, Any]] = []
+
+    if state_path and state_path.exists() and jsonl_path and jsonl_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("repo") == repo:
+            cursor = state.get("cursor")
+            page = int(state.get("page") or 0)
+            pr_count = int(state.get("count") or 0)
+            logger.info(
+                "Resuming fetch for %s from page %d (%d PRs on disk)...",
+                repo, page, pr_count,
+            )
+
+    logger.info("Fetching merged PRs for %s...", repo)
+    while True:
+        page += 1
+        variables = {"owner": owner, "name": name, "cursor": cursor, "pageSize": page_size}
+        data = github_graphql(token, GRAPHQL_QUERY, variables)
+        pr_connection = data["repository"]["pullRequests"]
+
+        nodes = pr_connection["nodes"] or []
+        if jsonl_path is not None:
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                for node in nodes:
+                    f.write(json.dumps(node, ensure_ascii=False) + "\n")
+        else:
+            all_prs_mem.extend(nodes)
+
+        pr_count += len(nodes)
+        logger.info("  page %d -> %d PRs fetched so far", page, pr_count)
+
+        page_info = pr_connection["pageInfo"]
+        if not page_info["hasNextPage"]:
+            logger.info("No more pages. Total fetched: %d PRs.", pr_count)
+            if jsonl_path is not None:
+                all_prs = _load_jsonl(jsonl_path)
+                jsonl_path.unlink(missing_ok=True)
+                if state_path:
+                    state_path.unlink(missing_ok=True)
+                return all_prs
+            return all_prs_mem
+
+        cursor = page_info["endCursor"]
+        if state_path is not None:
+            state_path.write_text(
+                json.dumps(
+                    {"repo": repo, "cursor": cursor, "page": page, "count": pr_count},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitLab fetch (merged MRs → GitHub-shaped PR dicts for shared pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gitlab_rest_get(
+    token: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    max_retries: int = 8,
+) -> Any:
+    headers = {"PRIVATE-TOKEN": token, "User-Agent": "pr_task_profile_report"}
+    url = f"{GITLAB_REST_URL}{path}"
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=120)
+        except requests.RequestException as exc:
+            last_err = f"network error: {exc}"
+            logger.warning("GitLab REST failed (attempt %d/%d): %s", attempt, max_retries, exc)
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        if response.status_code in (429, 502, 503, 504):
+            wait = min(2 ** attempt, 60)
+            last_err = f"HTTP {response.status_code}"
+            logger.warning(
+                "GitLab transient error (status %s). Waiting %ss (attempt %d/%d).",
+                response.status_code, wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
+        if response.status_code == 404:
+            raise RuntimeError(f"GitLab REST 404 (not found or no access): {url}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"GitLab REST error: {response.status_code} {response.text[:300]}")
+        if response.status_code == 204 or not response.text:
+            return None
+        return response.json()
+    raise RuntimeError(f"GitLab REST failed after {max_retries} retries. Last error: {last_err}")
+
+
+def gitlab_rest_paginated(
+    token: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    results: List[Any] = []
+    page = 1
+    base_params = dict(params or {})
+    while True:
+        page_params = dict(base_params)
+        page_params["per_page"] = 100
+        page_params["page"] = page
+        batch = gitlab_rest_get(token, path, page_params)
+        if not isinstance(batch, list) or not batch:
+            break
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return results
+
+
+def list_gitlab_group_projects(
+    token: str,
+    group: str,
+    include_archived: bool,
+) -> List[str]:
+    encoded_group = urllib.parse.quote(group, safe="")
+    logger.info("Listing GitLab projects for group %s...", group)
+    raw = gitlab_rest_paginated(
+        token,
+        f"/groups/{encoded_group}/projects",
+        {
+            "include_subgroups": "true",
+            "archived": "true" if include_archived else "false",
+            "order_by": "last_activity_at",
+        },
+    )
+    projects = [
+        p["path_with_namespace"]
+        for p in raw
+        if p.get("path_with_namespace")
+    ]
+    logger.info("  %s: %d projects", group, len(projects))
+    return projects
+
+
+def _gitlab_actor(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not user:
+        return {}
+    login = user.get("username") or ""
+    is_bot = bool(user.get("bot")) or login.endswith("[bot]") or "bot" in login.lower()
+    return {"login": login, "__typename": "Bot" if is_bot else "User"}
+
+
+def normalize_gitlab_mr(
+    mr: Dict[str, Any],
+    changes_payload: Optional[Dict[str, Any]],
+    notes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    change_list = (changes_payload or {}).get("changes") or []
+    paths = [
+        ch.get("new_path") or ch.get("old_path")
+        for ch in change_list
+        if ch.get("new_path") or ch.get("old_path")
+    ]
+
+    issue_comment_nodes: List[Dict[str, Any]] = []
+    review_nodes: List[Dict[str, Any]] = []
+    thread_nodes: List[Dict[str, Any]] = []
+
+    for note in notes:
+        if note.get("system"):
+            continue
+        body = note.get("body") or ""
+        if not body.strip():
+            continue
+        author = _gitlab_actor(note.get("author"))
+        note_type = note.get("type") or ""
+        if note_type == "DiffNote":
+            path = (note.get("position") or {}).get("new_path") or ""
+            thread_nodes.append(
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {
+                                "bodyText": body,
+                                "author": author,
+                                "path": path,
+                            }
+                        ],
+                    },
+                }
+            )
+            review_state = (
+                "CHANGES_REQUESTED"
+                if "requested changes" in body.lower()
+                else "COMMENTED"
+            )
+            review_nodes.append(
+                {"state": review_state, "bodyText": body, "author": author}
+            )
+        else:
+            issue_comment_nodes.append({"bodyText": body, "author": author})
+
+    description = mr.get("description") or ""
+    author = _gitlab_actor(mr.get("author"))
+
+    return {
+        "number": mr.get("iid"),
+        "title": mr.get("title") or "",
+        "bodyText": description,
+        "url": mr.get("web_url"),
+        "mergedAt": mr.get("merged_at"),
+        "changedFiles": len(paths) or int(mr.get("changes_count") or 0),
+        "additions": 0,
+        "deletions": 0,
+        "author": author,
+        "labels": {"nodes": [{"name": x} for x in (mr.get("labels") or [])]},
+        "commits": {"totalCount": 1},
+        "files": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"path": p} for p in paths],
+        },
+        "closingIssuesReferences": {"nodes": []},
+        "comments": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": issue_comment_nodes,
+        },
+        "reviews": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": review_nodes,
+        },
+        "reviewThreads": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": thread_nodes,
+        },
+    }
+
+
+def fetch_merged_gitlab_mrs(
+    token: str,
+    project: str,
+    sleep_seconds: float,
+    checkpoint_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    encoded = urllib.parse.quote(project, safe="")
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", f"gitlab_{project}")
+    jsonl_path = state_path = None
+    done_iids: set = set()
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = checkpoint_dir / f"{slug}_prs.jsonl"
+        state_path = checkpoint_dir / f"{slug}_fetch_state.json"
+        if jsonl_path.exists():
+            for row in _load_jsonl(jsonl_path):
+                iid = row.get("number")
+                if iid is not None:
+                    done_iids.add(int(iid))
+            if done_iids:
+                logger.info(
+                    "Resuming GitLab fetch for %s (%d MRs on disk)...",
+                    project, len(done_iids),
+                )
+
+    logger.info("Fetching merged MRs for GitLab %s...", project)
+    mr_list = gitlab_rest_paginated(
+        token,
+        f"/projects/{encoded}/merge_requests",
+        {"state": "merged", "order_by": "updated_at", "sort": "desc"},
+    )
+
+    fetched = 0
+    for mr in mr_list:
+        iid = mr.get("iid")
+        if iid is None:
+            continue
+        if int(iid) in done_iids:
+            continue
+
+        changes = gitlab_rest_get(token, f"/projects/{encoded}/merge_requests/{iid}/changes")
+        notes = gitlab_rest_paginated(
+            token,
+            f"/projects/{encoded}/merge_requests/{iid}/notes",
+        )
+        normalized = normalize_gitlab_mr(mr, changes, notes)
+
+        if jsonl_path is not None:
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+        done_iids.add(int(iid))
+        fetched += 1
+        if fetched % 25 == 0 or fetched == 1:
+            logger.info("  enriched %d new MRs (%d total on disk)", fetched, len(done_iids))
+
+        if state_path is not None:
+            state_path.write_text(
+                json.dumps(
+                    {"project": project, "count": len(done_iids), "last_iid": iid},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    logger.info("Total merged MRs fetched for %s: %d", project, len(done_iids))
+    if jsonl_path is not None and jsonl_path.exists():
+        all_prs = _load_jsonl(jsonl_path)
+        jsonl_path.unlink(missing_ok=True)
+        if state_path:
+            state_path.unlink(missing_ok=True)
+        return all_prs
+    return []
+
+
+def resolve_gitlab_targets(
+    token: str,
+    group_args: Optional[List[str]],
+    project_args: Optional[List[str]],
+    include_archived: bool,
+) -> List[str]:
+    projects: List[str] = []
+    seen = set()
+
+    def add(path: str) -> None:
+        key = path.lower()
+        if key not in seen:
+            seen.add(key)
+            projects.append(path)
+
+    for group in _split_csv_args(group_args):
+        for path in list_gitlab_group_projects(token, group, include_archived):
+            add(path)
+
+    for project in _split_csv_args(project_args):
+        add(project)
+
+    return projects
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Target resolution (single repo / multiple / org / user)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def github_rest_get(
+    token: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    max_retries: int = 5,
+) -> Any:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    url = f"{GITHUB_REST_URL}{path}"
+
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=60)
+        except requests.RequestException as exc:
+            last_err = f"network error: {exc}"
+            logger.warning("REST request failed (attempt %d/%d): %s", attempt, max_retries, exc)
+            time.sleep(min(2 ** attempt, 30))
+            continue
+
+        if response.status_code in (403, 429):
+            retry_after = response.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 60)
+            last_err = f"rate limited: {response.status_code} {response.text[:200]}"
+            logger.warning(
+                "GitHub REST rate limit (status %s). Waiting %ss (attempt %d/%d).",
+                response.status_code, wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code == 404:
+            raise RuntimeError(f"GitHub REST 404 (not found or no access): {url}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"GitHub REST error: {response.status_code} {response.text}")
+
+        return response.json()
+
+    raise RuntimeError(f"GitHub REST failed after {max_retries} retries. Last error: {last_err}")
+
+
+def github_rest_paginated(token: str, path: str, params: Dict[str, Any]) -> List[Any]:
+    results: List[Any] = []
+    page = 1
+    while True:
+        page_params = dict(params)
+        page_params["per_page"] = 100
+        page_params["page"] = page
+        batch = github_rest_get(token, path, page_params)
+        if not isinstance(batch, list) or not batch:
+            break
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return results
+
+
+def get_owner_type(token: str, owner: str) -> str:
+    """Return 'Organization' or 'User' for an owner login."""
+    data = github_rest_get(token, f"/users/{owner}")
+    return data.get("type", "User")
+
+
+def list_repos_for_owner(
+    token: str,
+    owner: str,
+    owner_type: Optional[str],
+    include_archived: bool,
+    include_forks: bool,
+) -> List[str]:
+    if owner_type is None:
+        owner_type = get_owner_type(token, owner)
+
+    if owner_type == "Organization":
+        path = f"/orgs/{owner}/repos"
+        params: Dict[str, Any] = {"type": "all", "sort": "updated"}
+    else:
+        path = f"/users/{owner}/repos"
+        params = {"type": "owner", "sort": "updated"}
+
+    logger.info("Listing repos for %s (%s)...", owner, owner_type)
+    raw = github_rest_paginated(token, path, params)
+
+    repos: List[str] = []
+    skipped_archived = skipped_forks = 0
+    for r in raw:
+        if r.get("archived") and not include_archived:
+            skipped_archived += 1
+            continue
+        if r.get("fork") and not include_forks:
+            skipped_forks += 1
+            continue
+        full = r.get("full_name")
+        if full:
+            repos.append(full)
+
+    logger.info(
+        "  %s: %d repos (skipped %d archived, %d forks)",
+        owner, len(repos), skipped_archived, skipped_forks,
+    )
+    return repos
+
+
+def _split_csv_args(values: Optional[List[str]]) -> List[str]:
+    out: List[str] = []
+    for item in values or []:
+        out.extend(piece.strip() for piece in item.split(",") if piece.strip())
+    return out
+
+
+def resolve_targets(
+    token: str,
+    repo_args: Optional[List[str]],
+    org_args: Optional[List[str]],
+    user_args: Optional[List[str]],
+    include_archived: bool,
+    include_forks: bool,
+) -> List[str]:
+    """Turn --repo/--org/--user into a de-duplicated list of owner/name repos."""
+    repos: List[str] = []
+    seen = set()
+
+    def add(full_name: str) -> None:
+        key = full_name.lower()
+        if key not in seen:
+            seen.add(key)
+            repos.append(full_name)
+
+    for entry in _split_csv_args(repo_args):
+        if "/" in entry:
+            add(entry)
+        else:
+            # Bare owner -> expand to all its repos (org or user, auto-detected).
+            for full in list_repos_for_owner(token, entry, None, include_archived, include_forks):
+                add(full)
+
+    for org in _split_csv_args(org_args):
+        for full in list_repos_for_owner(token, org, "Organization", include_archived, include_forks):
+            add(full)
+
+    for user in _split_csv_args(user_args):
+        for full in list_repos_for_owner(token, user, "User", include_archived, include_forks):
+            add(full)
+
+    return repos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deterministic signal extraction + rules
+# ─────────────────────────────────────────────────────────────────────────────
+
+def clean_text(text: Optional[str]) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def is_bot_actor(actor: Optional[Dict[str, Any]]) -> bool:
+    if not actor:
+        return False
+    login = clean_text(actor.get("login"))
+    typename = actor.get("__typename") or actor.get("type")
+    if typename == "Bot":
+        return True
+    if login.endswith("[bot]"):
+        return True
+    if login in BOT_LOGINS:
+        return True
+    if "bot" in login:
+        return True
+    return False
+
+
+def body_linked_issue_refs(body: str) -> List[str]:
+    refs = []
+    for match in LINKED_ISSUE_REGEX.finditer(body or ""):
+        refs.append(match.group(3))
+    return sorted(set(refs))
+
+
+def touches_tests(paths: List[str]) -> bool:
+    lower_paths = [p.lower() for p in paths]
+    return any(any(hint in path for hint in TEST_PATH_HINTS) for path in lower_paths)
+
+
+def mostly_generated_or_lockfiles(paths: List[str]) -> bool:
+    if not paths:
+        return False
+    lower_paths = [p.lower() for p in paths]
+    generated_count = sum(
+        1 for path in lower_paths if any(hint in path for hint in GENERATED_PATH_HINTS)
+    )
+    return generated_count / len(paths) >= 0.60
+
+
+def has_feature_or_bug_label(labels: List[str]) -> bool:
+    normalized = {clean_text(label) for label in labels}
+    useful = {
+        "feature",
+        "enhancement",
+        "bug",
+        "bugfix",
+        "fix",
+        "backend",
+        "frontend",
+        "api",
+        "tests",
+        "refactor",
+    }
+    return bool(normalized & useful)
+
+
+def is_trivial_comment(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return True
+    if t in TRIVIAL_COMMENT_EXACT:
+        return True
+    if len(t) <= 25:
+        for phrase in TRIVIAL_COMMENT_EXACT:
+            if t.startswith(phrase):
+                return True
+    trivial_phrases = (
+        "lgtm",
+        "looks good",
+        "approved",
+        "ship it",
+        "thanks",
+        "done",
+        "fixed",
+        "please rebase",
+        "rebase please",
+    )
+    if len(t) < 60 and any(phrase in t for phrase in trivial_phrases):
+        return True
+    return False
+
+
+def is_potentially_substantive_comment(text: str) -> bool:
+    t = clean_text(text)
+    if is_trivial_comment(t):
+        return False
+    if len(t) >= 120:
+        return True
+    return any(term in t for term in SUBSTANTIVE_TERMS)
+
+
+def flatten_discussion(pr: Dict[str, Any]) -> List[Dict[str, Any]]:
+    comments = []
+    for c in pr.get("comments", {}).get("nodes", []) or []:
+        comments.append(
+            {"kind": "issue_comment", "body": c.get("bodyText") or "", "author": c.get("author")}
+        )
+    for review in pr.get("reviews", {}).get("nodes", []) or []:
+        review_body = review.get("bodyText") or ""
+        if review_body.strip():
+            comments.append(
+                {"kind": "review_body", "body": review_body, "author": review.get("author")}
+            )
+        for c in review.get("comments", {}).get("nodes", []) or []:
+            comments.append(
+                {
+                    "kind": "review_comment",
+                    "body": c.get("bodyText") or "",
+                    "author": c.get("author"),
+                    "path": c.get("path"),
+                }
+            )
+    for thread in pr.get("reviewThreads", {}).get("nodes", []) or []:
+        for c in thread.get("comments", {}).get("nodes", []) or []:
+            comments.append(
+                {
+                    "kind": "review_thread_comment",
+                    "body": c.get("bodyText") or "",
+                    "author": c.get("author"),
+                    "path": c.get("path"),
+                    "thread_resolved": thread.get("isResolved"),
+                }
+            )
+    return comments
+
+
+def compute_size_axis(changed_files: int) -> str:
+    if changed_files <= 2:
+        return "tiny"
+    if changed_files <= 10:
+        return "small_mid"
+    return "large"
+
+
+def compute_richness_axis(
+    linked_issue_count: int,
+    non_bot_comments: List[Dict[str, Any]],
+    non_bot_reviewers_count: int,
+    has_changes_requested: bool,
+) -> Tuple[str, int]:
+    substantive_comments = [
+        c for c in non_bot_comments if is_potentially_substantive_comment(c.get("body", ""))
+    ]
+    substantive_count = len(substantive_comments)
+    has_linked_issue = linked_issue_count > 0
+
+    if has_linked_issue and (
+        substantive_count >= 1
+        or has_changes_requested
+        or (non_bot_reviewers_count >= 2 and len(non_bot_comments) >= 2)
+    ):
+        return "substantive", substantive_count
+    if has_linked_issue or len(non_bot_comments) > 0:
+        return "light", substantive_count
+    return "none", substantive_count
+
+
+def extract_signals(pr: Dict[str, Any]) -> Dict[str, Any]:
+    author = pr.get("author")
+    author_is_bot = is_bot_actor(author)
+
+    labels = [x["name"] for x in pr.get("labels", {}).get("nodes", []) or []]
+    changed_files = int(pr.get("changedFiles") or 0)
+    additions = int(pr.get("additions") or 0)
+    deletions = int(pr.get("deletions") or 0)
+
+    file_nodes = pr.get("files", {}).get("nodes", []) or []
+    paths = [x["path"] for x in file_nodes if x.get("path")]
+    file_list_complete = not pr.get("files", {}).get("pageInfo", {}).get("hasNextPage", False)
+
+    closing_issues = pr.get("closingIssuesReferences", {}).get("nodes", []) or []
+    closing_issue_refs = [f"#{x['number']}" for x in closing_issues if x.get("number")]
+    body_issue_refs = body_linked_issue_refs(pr.get("bodyText") or "")
+    linked_issue_refs = sorted(set(closing_issue_refs + body_issue_refs))
+    linked_issue_count = len(linked_issue_refs)
+
+    all_comments = flatten_discussion(pr)
+    non_bot_comments = [c for c in all_comments if not is_bot_actor(c.get("author"))]
+
+    review_nodes = pr.get("reviews", {}).get("nodes", []) or []
+    non_bot_reviewers = {
+        r.get("author", {}).get("login")
+        for r in review_nodes
+        if r.get("author") and not is_bot_actor(r.get("author"))
+    }
+    non_bot_reviewers.discard(None)
+
+    has_changes_requested = any(
+        r.get("state") == "CHANGES_REQUESTED" and not is_bot_actor(r.get("author"))
+        for r in review_nodes
+    )
+
+    size_axis = compute_size_axis(changed_files)
+    richness_axis, substantive_comment_count = compute_richness_axis(
+        linked_issue_count=linked_issue_count,
+        non_bot_comments=non_bot_comments,
+        non_bot_reviewers_count=len(non_bot_reviewers),
+        has_changes_requested=has_changes_requested,
+    )
+
+    discussion_incomplete = (
+        pr.get("comments", {}).get("pageInfo", {}).get("hasNextPage", False)
+        or pr.get("reviews", {}).get("pageInfo", {}).get("hasNextPage", False)
+        or pr.get("reviewThreads", {}).get("pageInfo", {}).get("hasNextPage", False)
+    )
+
+    return {
+        "number": pr.get("number"),
+        "url": pr.get("url"),
+        "title": pr.get("title") or "",
+        "author": author.get("login") if author else "",
+        "author_is_bot": author_is_bot,
+        "merged_at": pr.get("mergedAt"),
+        "changed_files": changed_files,
+        "additions": additions,
+        "deletions": deletions,
+        "commits": pr.get("commits", {}).get("totalCount", 0),
+        "labels": labels,
+        "paths": paths,
+        "file_list_complete": file_list_complete,
+        "touches_tests": touches_tests(paths),
+        "generated_or_lockfile_heavy": mostly_generated_or_lockfiles(paths),
+        "feature_or_bug_label": has_feature_or_bug_label(labels),
+        "linked_issue_count": linked_issue_count,
+        "linked_issue_refs": linked_issue_refs,
+        "non_bot_comments": non_bot_comments,
+        "non_bot_comment_count": len(non_bot_comments),
+        "substantive_comment_count": substantive_comment_count,
+        "non_bot_reviewers_count": len(non_bot_reviewers),
+        "has_changes_requested": has_changes_requested,
+        "discussion_incomplete": discussion_incomplete,
+        "size_axis": size_axis,
+        "richness_axis": richness_axis,
+    }
+
+
+def rules_classify(sig: Dict[str, Any]) -> Tuple[str, str]:
+    size_axis = sig["size_axis"]
+    richness_axis = sig["richness_axis"]
+    has_tests = sig["touches_tests"]
+    generated_or_lockfile_heavy = sig["generated_or_lockfile_heavy"]
+    feature_or_bug_label = sig["feature_or_bug_label"]
+    linked_issue_count = sig["linked_issue_count"]
+
+    if sig["author_is_bot"]:
+        return "automated", "Bot-authored PR."
+    if richness_axis == "substantive" and linked_issue_count > 0 and not generated_or_lockfile_heavy:
+        return "rich_task", "Linked issue plus substantive non-bot review discussion."
+    if (
+        size_axis == "tiny"
+        and richness_axis == "none"
+        and not has_tests
+        and not generated_or_lockfile_heavy
+    ):
+        return "simple_fix", "Tiny human PR with no meaningful non-bot discussion."
+    if generated_or_lockfile_heavy and richness_axis != "substantive":
+        return "other", "Mechanical/generated or lockfile-heavy PR."
+    if (
+        size_axis == "small_mid" or has_tests or feature_or_bug_label
+    ) and richness_axis in {"none", "light"}:
+        return "standard_feature_work", "Normal human implementation PR without rich review signals."
+    return "other", "Does not cleanly fit simple, standard, or rich definitions."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM pass
+# ─────────────────────────────────────────────────────────────────────────────
+
+def comment_samples(sig: Dict[str, Any], max_samples: int = 8, max_len: int = 280) -> List[str]:
+    samples: List[str] = []
+    for c in sig["non_bot_comments"]:
+        body = (c.get("body") or "").strip()
+        if not body or is_trivial_comment(body):
+            continue
+        snippet = " ".join(body.split())[:max_len]
+        samples.append(f"[{c.get('kind')}] {snippet}")
+        if len(samples) >= max_samples:
+            break
+    return samples
+
+
+def build_llm_input(sig: Dict[str, Any], body_text: str) -> Dict[str, Any]:
+    return {
+        "number": sig["number"],
+        "title": sig["title"],
+        "body_excerpt": " ".join((body_text or "").split())[:800],
+        "changed_files": sig["changed_files"],
+        "additions": sig["additions"],
+        "deletions": sig["deletions"],
+        "file_paths_sample": sig["paths"][:30],
+        "touches_tests": sig["touches_tests"],
+        "generated_or_lockfile_heavy": sig["generated_or_lockfile_heavy"],
+        "labels": sig["labels"],
+        "linked_issue_count": sig["linked_issue_count"],
+        "non_bot_comment_count": sig["non_bot_comment_count"],
+        "substantive_comment_count": sig["substantive_comment_count"],
+        "non_bot_reviewers_count": sig["non_bot_reviewers_count"],
+        "has_changes_requested": sig["has_changes_requested"],
+        "discussion_samples": comment_samples(sig),
+    }
+
+
+def classify_with_llm(
+    client: Any,
+    model: str,
+    llm_input: Dict[str, Any],
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    user_content = json.dumps(llm_input, ensure_ascii=False)
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            content = resp.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+            category = parsed.get("category")
+            if category not in CATEGORIES:
+                logger.debug("PR #%s: LLM returned unknown category %r -> other",
+                             llm_input.get("number"), category)
+                category = "other"
+            return {
+                "llm_category": category,
+                "llm_confidence": parsed.get("confidence", "low"),
+                "llm_reason": (parsed.get("reason") or "")[:300],
+            }
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            logger.warning(
+                "PR #%s: LLM call failed (attempt %d/%d): %s",
+                llm_input.get("number"), attempt, max_retries, exc,
+            )
+            time.sleep(1.5 * attempt)
+    logger.error("PR #%s: LLM classification failed permanently: %s",
+                 llm_input.get("number"), last_err)
+    return {
+        "llm_category": "error",
+        "llm_confidence": "low",
+        "llm_reason": f"LLM call failed: {last_err}",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_prs(
+    prs: List[Dict[str, Any]],
+    model: str,
+    max_workers: int,
+    repo: str,
+    client: Any = None,
+) -> List[Dict[str, Any]]:
+    if client is None:
+        from openai import OpenAI
+
+        client = OpenAI()
+
+    logger.info("Extracting deterministic signals for %d PRs...", len(prs))
+    signals = [extract_signals(pr) for pr in prs]
+    body_texts = [pr.get("bodyText") or "" for pr in prs]
+    rules = [rules_classify(sig) for sig in signals]
+
+    bot_count = sum(1 for s in signals if s["author_is_bot"])
+    logger.info("Signals ready. %d bot-authored PRs will skip the LLM.", bot_count)
+    logger.info("Running LLM classification with model=%s, workers=%d...", model, max_workers)
+
+    def worker(idx: int) -> Tuple[int, Dict[str, Any]]:
+        sig = signals[idx]
+        if sig["author_is_bot"]:
+            return idx, {
+                "llm_category": "automated",
+                "llm_confidence": "high",
+                "llm_reason": "Bot-authored PR (no LLM call).",
+            }
+        llm_input = build_llm_input(sig, body_texts[idx])
+        return idx, classify_with_llm(client, model, llm_input)
+
+    results: Dict[int, Dict[str, Any]] = {}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(worker, i) for i in range(len(prs))]
+        for fut in as_completed(futures):
+            idx, llm_result = fut.result()
+            results[idx] = llm_result
+            completed += 1
+            sig = signals[idx]
+            logger.debug(
+                "PR #%s | rules=%s | llm=%s | conf=%s | %s",
+                sig["number"], rules[idx][0], llm_result["llm_category"],
+                llm_result.get("llm_confidence"), sig["title"][:80],
+            )
+            if completed % 25 == 0 or completed == len(prs):
+                logger.info("  classified %d/%d", completed, len(prs))
+
+    rows: List[Dict[str, Any]] = []
+    for idx, sig in enumerate(signals):
+        rules_category, rules_reason = rules[idx]
+        llm_result = results.get(idx, {})
+        llm_category = llm_result.get("llm_category", "error")
+        agree = rules_category == llm_category
+        if not agree and llm_category not in ("error",):
+            logger.debug("DISAGREEMENT PR #%s: rules=%s llm=%s",
+                         sig["number"], rules_category, llm_category)
+        rows.append(
+            {
+                "repository": repo,
+                "number": sig["number"],
+                "url": sig["url"],
+                "title": sig["title"],
+                "author": sig["author"],
+                "author_is_bot": sig["author_is_bot"],
+                "merged_at": sig["merged_at"],
+                "changed_files": sig["changed_files"],
+                "additions": sig["additions"],
+                "deletions": sig["deletions"],
+                "commits": sig["commits"],
+                "rules_category": rules_category,
+                "rules_reason": rules_reason,
+                "llm_category": llm_category,
+                "llm_confidence": llm_result.get("llm_confidence", ""),
+                "llm_reason": llm_result.get("llm_reason", ""),
+                "agree": agree,
+                "touches_tests": sig["touches_tests"],
+                "generated_or_lockfile_heavy": sig["generated_or_lockfile_heavy"],
+                "linked_issue_count": sig["linked_issue_count"],
+                "linked_issue_refs": ",".join(sig["linked_issue_refs"]),
+                "non_bot_comment_count": sig["non_bot_comment_count"],
+                "substantive_comment_count": sig["substantive_comment_count"],
+                "non_bot_reviewers_count": sig["non_bot_reviewers_count"],
+                "has_changes_requested": sig["has_changes_requested"],
+                "size_axis": sig["size_axis"],
+                "richness_axis": sig["richness_axis"],
+                "labels": ",".join(sig["labels"]),
+                "file_paths_sample": ",".join(sig["paths"][:30]),
+                "file_list_complete": sig["file_list_complete"],
+                "discussion_incomplete": sig["discussion_incomplete"],
+            }
+        )
+    return rows
+
+
+def build_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(rows)
+
+    def pct(n: int, d: int) -> float:
+        return round((n / d) * 100, 2) if d else 0.0
+
+    rules_counts = Counter(r["rules_category"] for r in rows)
+    llm_counts = Counter(r["llm_category"] for r in rows)
+    comparable = [r for r in rows if r["llm_category"] != "error"]
+    agree_count = sum(1 for r in comparable if r["agree"])
+    disagreements = Counter(
+        f"{r['rules_category']} -> {r['llm_category']}"
+        for r in comparable
+        if not r["agree"]
+    )
+
+    return {
+        "total_merged_prs_analyzed": total,
+        "rules": {
+            "counts": dict(rules_counts),
+            "percentages": {k: pct(v, total) for k, v in rules_counts.items()},
+        },
+        "llm": {
+            "counts": dict(llm_counts),
+            "percentages": {k: pct(v, total) for k, v in llm_counts.items()},
+        },
+        "agreement": {
+            "comparable_prs": len(comparable),
+            "agree_count": agree_count,
+            "agreement_rate_pct": pct(agree_count, len(comparable)),
+            "top_disagreements": disagreements.most_common(15),
+            "error_count": sum(1 for r in rows if r["llm_category"] == "error"),
+        },
+        "notes": [
+            "rules_category is the deterministic rulebook; llm_category is the LLM judging the same signals.",
+            "Bot-authored PRs are labeled 'automated' by both, before discussion is counted.",
+            "agree=True means both methods produced the same label for that PR.",
+            "rich_task requires a linked issue; detection uses closingIssuesReferences + body regex. "
+            "Issues linked only via the GitHub UI sidebar may be undercounted.",
+            "Percentages are over all analyzed merged PRs (including automated).",
+        ],
+    }
+
+
+def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        logger.warning("No rows to write to CSV.")
+        return
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Wrote per-PR CSV: %s", path)
+
+
+def write_json(path: Path, payload: Dict[str, Any], label: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    logger.info("Wrote %s: %s", label, path)
+
+
+def safe_repo_slug(repo: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", repo)
+
+
+PROFILE_CATEGORIES = [
+    "simple_fix",
+    "standard_feature_work",
+    "rich_task",
+    "other",
+    "automated",
+]
+
+
+def _pct_columns(prefix: str, percentages: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        f"{prefix}_{cat}_pct": percentages.get(cat, 0.0 if percentages else "")
+        for cat in PROFILE_CATEGORIES
+    }
+
+
+def build_org_repo_row(
+    repository: str,
+    summary: Dict[str, Any],
+    platform: str = "",
+) -> Dict[str, Any]:
+    total = summary.get("total_merged_prs_analyzed", 0)
+    rules_pct = summary.get("rules", {}).get("percentages", {})
+    llm_pct = summary.get("llm", {}).get("percentages", {})
+    agreement = summary.get("agreement", {})
+    row: Dict[str, Any] = {
+        "repository": repository,
+        "platform": platform,
+        "total_prs": total,
+        "agreement_rate_pct": agreement.get("agreement_rate_pct", ""),
+        "llm_error_count": agreement.get("error_count", 0),
+    }
+    row.update(_pct_columns("rules", rules_pct if total else {}))
+    row.update(_pct_columns("llm", llm_pct if total else {}))
+    return row
+
+
+def build_org_total_row(rows: List[Dict[str, Any]], label: str = "org total") -> Dict[str, Any]:
+    data = [r for r in rows if int(r.get("total_prs") or 0) > 0]
+    total_prs = sum(int(r["total_prs"]) for r in data)
+    total_row: Dict[str, Any] = {
+        "repository": label,
+        "platform": "",
+        "total_prs": total_prs,
+        "agreement_rate_pct": "",
+        "llm_error_count": sum(int(r.get("llm_error_count") or 0) for r in data),
+    }
+    if not total_prs:
+        for prefix in ("rules", "llm"):
+            for cat in PROFILE_CATEGORIES:
+                total_row[f"{prefix}_{cat}_pct"] = ""
+        return total_row
+
+    for prefix in ("rules", "llm"):
+        counts = {cat: 0.0 for cat in PROFILE_CATEGORIES}
+        for r in data:
+            n = int(r["total_prs"])
+            for cat in PROFILE_CATEGORIES:
+                pct = r.get(f"{prefix}_{cat}_pct")
+                if pct not in ("", None):
+                    counts[cat] += n * float(pct) / 100.0
+        for cat in PROFILE_CATEGORIES:
+            total_row[f"{prefix}_{cat}_pct"] = round(counts[cat] / total_prs * 100, 2)
+
+    comparable = 0
+    agree = 0
+    for r in data:
+        n = int(r["total_prs"])
+        rate = r.get("agreement_rate_pct")
+        if rate not in ("", None):
+            comparable += n
+            agree += n * float(rate) / 100.0
+    total_row["agreement_rate_pct"] = round(agree / comparable * 100, 2) if comparable else ""
+    return total_row
+
+
+def write_org_summary(
+    run_dir: Path,
+    per_repo_summaries: Dict[str, Any],
+    platform_by_repo: Dict[str, str],
+    metadata: Dict[str, Any],
+    combined_summary: Dict[str, Any],
+    failed_repos: Dict[str, str],
+) -> Tuple[Path, Path]:
+    repo_rows = [
+        build_org_repo_row(repo, summary, platform_by_repo.get(repo, ""))
+        for repo, summary in per_repo_summaries.items()
+    ]
+    repo_rows.sort(key=lambda r: (-int(r.get("total_prs") or 0), r["repository"]))
+    org_total = build_org_total_row(repo_rows, label="org total")
+
+    csv_rows = repo_rows + [org_total]
+    org_csv = run_dir / "org_summary.csv"
+    write_csv(org_csv, csv_rows)
+
+    org_json = run_dir / "org_summary.json"
+    payload = {
+        "metadata": metadata,
+        "org_total": org_total,
+        "combined_summary": combined_summary,
+        "repositories": repo_rows,
+        "failures": failed_repos,
+    }
+    write_json(org_json, payload, label="org-level repo summary")
+    return org_csv, org_json
+
+
+def create_run_zip(
+    run_dir: Path,
+    run_id: str,
+    org_csv: Path,
+    org_json: Path,
+    log_path: Path,
+    failures_path: Optional[Path] = None,
+) -> Path:
+    zip_path = run_dir / f"{run_id}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in (org_csv, org_json, log_path):
+            if path.exists():
+                zf.write(path, arcname=path.name)
+        if failures_path and failures_path.exists():
+            zf.write(failures_path, arcname=failures_path.name)
+    logger.info("Wrote run archive: %s", zip_path)
+    return zip_path
+
+
+def log_summary_block(title: str, summary: Dict[str, Any]) -> None:
+    logger.info("-" * 70)
+    logger.info("SUMMARY: %s", title)
+    logger.info("Total merged PRs analyzed : %d", summary["total_merged_prs_analyzed"])
+    logger.info("Rules distribution        : %s", summary["rules"]["percentages"])
+    logger.info("LLM distribution          : %s", summary["llm"]["percentages"])
+    logger.info("Agreement rate            : %.2f%% (%d/%d)",
+                summary["agreement"]["agreement_rate_pct"],
+                summary["agreement"]["agree_count"],
+                summary["agreement"]["comparable_prs"])
+    logger.info("Top disagreements         : %s", summary["agreement"]["top_disagreements"][:5])
+    logger.info("-" * 70)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="GitHub PR task-profile report (deterministic rules + LLM). "
+                    "Scan one repo, many repos, a whole org, or a user's repos.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--repo", action="append", default=None,
+        help="owner/name for a single repo, OR a bare owner to scan all its repos. "
+             "Repeatable and comma-separated (e.g. --repo a/b,c/d).",
+    )
+    parser.add_argument(
+        "--org", action="append", default=None,
+        help="Organization login; scans all its repos. Repeatable / comma-separated.",
+    )
+    parser.add_argument(
+        "--user", action="append", default=None,
+        help="User login; scans all their repos. Repeatable / comma-separated.",
+    )
+    parser.add_argument(
+        "--gitlab-group", action="append", default=None,
+        help="GitLab group; scans all its projects (include_subgroups). Repeatable / comma-separated.",
+    )
+    parser.add_argument(
+        "--gitlab-project", action="append", default=None,
+        help="GitLab project path (group/project). Repeatable / comma-separated.",
+    )
+    parser.add_argument("--include-archived", action="store_true",
+                        help="Include archived repos when expanding an org/user.")
+    parser.add_argument("--no-forks", dest="include_forks", action="store_false",
+                        help="Exclude forked repos (default: forks excluded).")
+    parser.add_argument("--include-forks", dest="include_forks", action="store_true",
+                        help="Include forked repos when expanding an org/user.")
+    parser.set_defaults(include_forks=False)
+    parser.add_argument("--output-dir", default="outputs", help="Base directory for report files.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model for the LLM pass.")
+    parser.add_argument("--max-workers", type=int, default=6, help="Parallel LLM calls.")
+    parser.add_argument("--page-size", type=int, default=50,
+                        help="Merged PRs per GraphQL page (lower if you see 502 errors).")
+    parser.add_argument("--sleep", type=float, default=0.2, help="Sleep seconds between GraphQL pages.")
+    parser.add_argument("--verbose", action="store_true", help="Verbose (DEBUG) console output.")
+    args = parser.parse_args()
+
+    has_github = bool(args.repo or args.org or args.user)
+    has_gitlab = bool(args.gitlab_group or args.gitlab_project)
+    if not (has_github or has_gitlab):
+        parser.error(
+            "Provide at least one of --repo, --org, --user, --gitlab-group, or --gitlab-project."
+        )
+
+    started_at = datetime.now(timezone.utc)
+    timestamp = started_at.strftime("%Y%m%d_%H%M%S")
+
+    # Provisional run_id; refined once we know how many repos resolved.
+    run_id = f"scan_{timestamp}"
+    output_dir = Path(args.output_dir)
+    run_dir = output_dir / run_id
+    repos_dir = run_dir / "repos"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    repos_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / f"{run_id}.log"
+
+    setup_logging(log_path, verbose=args.verbose)
+
+    logger.info("=" * 70)
+    logger.info("PR Task-Profile Report v%s", VERSION)
+    logger.info("run_id        : %s", run_id)
+    logger.info("targets       : repo=%s org=%s user=%s", args.repo, args.org, args.user)
+    logger.info("gitlab        : group=%s project=%s", args.gitlab_group, args.gitlab_project)
+    logger.info("llm model     : %s", args.model)
+    logger.info("page size     : %s", args.page_size)
+    logger.info("max workers   : %s", args.max_workers)
+    logger.info("include forks : %s | include archived: %s", args.include_forks, args.include_archived)
+    logger.info("output dir    : %s", run_dir.resolve())
+    logger.info("=" * 70)
+
+    github_token = os.getenv("GITHUB_TOKEN")
+    gitlab_token = os.getenv("GITLAB_TOKEN")
+    if has_github and not github_token:
+        logger.error("GITHUB_TOKEN is not set (env or .env). Aborting.")
+        sys.exit(1)
+    if has_gitlab and not gitlab_token:
+        logger.error("GITLAB_TOKEN is not set (env or .env). Aborting.")
+        sys.exit(1)
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("OPENAI_API_KEY is not set (env or .env). The LLM pass is required. Aborting.")
+        sys.exit(1)
+
+    scan_targets: List[Tuple[str, str]] = []  # (platform, repo_or_project)
+
+    if has_github:
+        try:
+            github_repos = resolve_targets(
+                token=github_token,
+                repo_args=args.repo,
+                org_args=args.org,
+                user_args=args.user,
+                include_archived=args.include_archived,
+                include_forks=args.include_forks,
+            )
+            scan_targets.extend(("github", r) for r in github_repos)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to resolve GitHub targets: %s", exc)
+            sys.exit(1)
+
+    if has_gitlab:
+        try:
+            gitlab_projects = resolve_gitlab_targets(
+                token=gitlab_token,
+                group_args=args.gitlab_group,
+                project_args=args.gitlab_project,
+                include_archived=args.include_archived,
+            )
+            scan_targets.extend(("gitlab", p) for p in gitlab_projects)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to resolve GitLab targets: %s", exc)
+            sys.exit(1)
+
+    if not scan_targets:
+        logger.warning("No repositories resolved from the given targets. Nothing to do.")
+        sys.exit(0)
+
+    logger.info("Resolved %d repositor%s to scan:", len(scan_targets), "y" if len(scan_targets) == 1 else "ies")
+    for platform, name in scan_targets:
+        logger.info("  - [%s] %s", platform, name)
+
+    # One OpenAI client shared across all repos.
+    from openai import OpenAI
+
+    client = OpenAI()
+
+    all_rows: List[Dict[str, Any]] = []
+    per_repo_summaries: Dict[str, Any] = {}
+    platform_by_repo: Dict[str, str] = {}
+    failed_repos: Dict[str, str] = {}
+
+    for i, (platform, repo) in enumerate(scan_targets, start=1):
+        logger.info("=" * 70)
+        logger.info("[%d/%d] Scanning [%s] %s", i, len(scan_targets), platform, repo)
+        logger.info("=" * 70)
+        try:
+            if platform == "github":
+                prs = fetch_merged_prs(
+                    token=github_token,
+                    repo=repo,
+                    sleep_seconds=args.sleep,
+                    checkpoint_dir=Path(args.output_dir) / "checkpoints",
+                    page_size=args.page_size,
+                )
+            else:
+                prs = fetch_merged_gitlab_mrs(
+                    token=gitlab_token,
+                    project=repo,
+                    sleep_seconds=args.sleep,
+                    checkpoint_dir=Path(args.output_dir) / "checkpoints",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to fetch PRs for %s: %s", repo, exc)
+            failed_repos[repo] = f"fetch failed: {exc}"
+            continue
+
+        platform_by_repo[repo] = platform
+
+        if not prs:
+            logger.warning("No merged PRs found for %s. Skipping.", repo)
+            per_repo_summaries[repo] = {"total_merged_prs_analyzed": 0}
+            continue
+
+        try:
+            rows = process_prs(
+                prs, model=args.model, max_workers=args.max_workers,
+                repo=repo, client=client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Classification failed for %s: %s", repo, exc)
+            failed_repos[repo] = f"classification failed: {exc}"
+            continue
+
+        repo_summary = build_summary(rows)
+        per_repo_summaries[repo] = repo_summary
+        all_rows.extend(rows)
+
+        slug = safe_repo_slug(repo)
+        write_csv(repos_dir / f"{slug}.csv", rows)
+        write_json(
+            repos_dir / f"{slug}.json",
+            {
+                "metadata": {
+                    "report_version": VERSION,
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "repository": repo,
+                    "platform": platform,
+                    "llm_model": args.model,
+                    "tool": "pr_task_profile_report.py",
+                },
+                "summary": repo_summary,
+                "results": rows,
+            },
+            label=f"per-repo report for {repo}",
+        )
+        log_summary_block(repo, repo_summary)
+
+    if not all_rows:
+        logger.error("No PRs were classified across any repo. See failures: %s", failed_repos)
+        sys.exit(1)
+
+    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    combined_summary = build_summary(all_rows)
+
+    combined_report = {
+        "metadata": {
+            "report_version": VERSION,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id,
+            "llm_model": args.model,
+            "started_at_utc": started_at.isoformat(),
+            "elapsed_seconds": round(elapsed, 1),
+            "tool": "pr_task_profile_report.py",
+            "targets": {
+                "repo": args.repo,
+                "org": args.org,
+                "user": args.user,
+                "gitlab_group": args.gitlab_group,
+                "gitlab_project": args.gitlab_project,
+            },
+            "repositories_scanned": list(per_repo_summaries.keys()),
+            "repositories_failed": failed_repos,
+            "repo_count": len(per_repo_summaries),
+        },
+        "combined_summary": combined_summary,
+        "per_repository_summary": {
+            repo: {
+                "total_merged_prs_analyzed": s.get("total_merged_prs_analyzed", 0),
+                "rules_percentages": s.get("rules", {}).get("percentages", {}),
+                "llm_percentages": s.get("llm", {}).get("percentages", {}),
+                "agreement_rate_pct": s.get("agreement", {}).get("agreement_rate_pct"),
+            }
+            for repo, s in per_repo_summaries.items()
+        },
+        "results": all_rows,
+    }
+
+    combined_json = run_dir / "combined_report.json"
+    combined_csv = run_dir / "combined_per_pr.csv"
+    write_json(combined_json, combined_report, label="combined report")
+    write_csv(combined_csv, all_rows)
+
+    org_csv, org_json = write_org_summary(
+        run_dir=run_dir,
+        per_repo_summaries=per_repo_summaries,
+        platform_by_repo=platform_by_repo,
+        metadata=combined_report["metadata"],
+        combined_summary=combined_summary,
+        failed_repos=failed_repos,
+    )
+
+    zip_path: Optional[Path] = None
+    failures_path: Optional[Path] = None
+    if failed_repos:
+        logger.warning("Repos that failed: %s", failed_repos)
+        failures_path = run_dir / "failures.json"
+        write_json(failures_path, {"failures": failed_repos}, label="failures report")
+
+    zip_path = create_run_zip(
+        run_dir=run_dir,
+        run_id=run_id,
+        org_csv=org_csv,
+        org_json=org_json,
+        log_path=log_path,
+        failures_path=failures_path,
+    )
+
+    log_summary_block(f"COMBINED across {len(per_repo_summaries)} repos", combined_summary)
+    logger.info("Elapsed: %.1fs", elapsed)
+    logger.info("Deliverables:")
+    logger.info("  Org summary CSV : %s", org_csv.resolve())
+    logger.info("  Org summary JSON: %s", org_json.resolve())
+    logger.info("  Combined JSON   : %s", combined_json.resolve())
+    logger.info("  Combined CSV    : %s", combined_csv.resolve())
+    logger.info("  Per-repo dir    : %s", repos_dir.resolve())
+    logger.info("  LOG             : %s", log_path.resolve())
+    logger.info("  ZIP archive     : %s", zip_path.resolve())
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
