@@ -300,6 +300,13 @@ SECRET_PATTERNS = [
     re.compile(r'bearer\s+[A-Za-z0-9\-_\.]{20,}', re.I),
 ]
 
+
+def mask_secrets(text: str) -> str:
+    """Replace all detected secrets with [REDACTED] in text."""
+    for pat in SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    return text
+
 # Observability signal patterns (grep in source)
 LOGGING_FRAMEWORKS = {
     "js": ["pino", "winston", "bunyan", "log4js", "loglevel", "@nestjs/common"],
@@ -755,6 +762,8 @@ def analyze_security(root: Path, source_files: list[tuple[Path, str]]) -> dict:
                     for pat in SECRET_PATTERNS:
                         if pat.search(line):
                             hit_text = line.strip()[:120]
+                            # Mask secrets before adding to artifact
+                            hit_text = mask_secrets(hit_text)
                             secret_hits.append({
                                 "file": rel_path,
                                 "line": i,
