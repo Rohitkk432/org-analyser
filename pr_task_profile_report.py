@@ -82,6 +82,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+# Shared redacting OpenAI client. This script sends PR titles, bodies and human
+# review comments, so it must not construct a bare OpenAI() client.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "repo-eval-kit"))
+from llm_safety import safe_openai  # noqa: E402
+
 try:
     from dotenv import load_dotenv
 
@@ -1286,9 +1291,7 @@ def process_prs(
     client: Any = None,
 ) -> List[Dict[str, Any]]:
     if client is None:
-        from openai import OpenAI
-
-        client = OpenAI()
+        client = safe_openai()
 
     logger.info("Extracting deterministic signals for %d PRs...", len(prs))
     signals = [extract_signals(pr) for pr in prs]
@@ -1707,9 +1710,7 @@ def main() -> None:
         logger.info("  - [%s] %s", platform, name)
 
     # One OpenAI client shared across all repos.
-    from openai import OpenAI
-
-    client = OpenAI()
+    client = safe_openai()
 
     all_rows: List[Dict[str, Any]] = []
     per_repo_summaries: Dict[str, Any] = {}

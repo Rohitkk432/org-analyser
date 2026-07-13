@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -112,8 +113,10 @@ def resolve_clones_dir(run_dir: Path) -> Path:
 
 sys.path.insert(0, str(CODING))
 sys.path.insert(0, str(PROFILER_ROOT))
+sys.path.insert(0, str(EVAL_KIT))
 
 from count_merged_prs import list_github_repos, list_gitlab_projects  # noqa: E402
+from credential_redactor import scrub_secrets  # noqa: E402
 from export_all_merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
@@ -589,17 +592,22 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
     cmd.extend([clone_url(entry, ctx.tokens, ctx), str(dest)])
 
     env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
-    # Pass token via environment variable instead of embedding in URL
+    # Auth via git's env-config channel. GIT_ASKPASS_OVERRIDE and
+    # GIT_HTTP_EXTRAHEADER (used here previously) are not git variables at all
+    # -- git never read them, so private clones were silently falling back to
+    # whatever ambient credential helper the host happened to have.
+    # GIT_CONFIG_COUNT/KEY/VALUE is the real mechanism, and unlike `-c` it keeps
+    # the token off argv.
+    token = ""
     if entry.platform == "github":
         token = ctx.tokens.get(ctx.github_token_name, "")
-        if token:
-            env["GIT_ASKPASS_OVERRIDE"] = token
-            env["GIT_HTTP_EXTRAHEADER"] = f"AUTHORIZATION: basic {__import__('base64').b64encode((f':{token}').encode()).decode()}"
     elif entry.platform == "gitlab":
         token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
-        if token:
-            env["GIT_ASKPASS_OVERRIDE"] = token
-            env["GIT_HTTP_EXTRAHEADER"] = f"PRIVATE-TOKEN: {token}"
+    if token:
+        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
@@ -607,9 +615,13 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
         return False, "clone timeout", None
     if proc.returncode != 0:
         err_msg = (proc.stderr or proc.stdout or "")[-800:]
-        # Sanitize error message to remove any accidentally exposed tokens
-        err_msg = err_msg.replace(ctx.tokens.get(ctx.github_token_name, ""), "[REDACTED]")
-        err_msg = err_msg.replace(ctx.tokens.get(GITLAB_TOKEN_NAME, ""), "[REDACTED]")
+        # scrub_secrets ignores empty/short strings; a bare str.replace("", ...)
+        # on a missing token would splice the marker between every character.
+        err_msg = scrub_secrets(
+            err_msg,
+            ctx.tokens.get(ctx.github_token_name, ""),
+            ctx.tokens.get(GITLAB_TOKEN_NAME, ""),
+        )
         return False, err_msg, None
 
     verify = subprocess.run(
@@ -639,8 +651,16 @@ def run_py(
     args: list[str],
     timeout: int = 900,
     cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
-    """Run a Python script; return (exit_code, stdout, stderr)."""
+    """Run a Python script; return (exit_code, stdout, stderr).
+
+    Pass secrets through extra_env, never through args: argv is world-readable
+    via `ps` and /proc/<pid>/cmdline.
+    """
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.run(
             [PYTHON_BIN, str(script), *args],
@@ -648,7 +668,7 @@ def run_py(
             text=True,
             timeout=timeout,
             cwd=str(cwd) if cwd else None,
-            env=os.environ.copy(),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return 1, "", "timeout"
@@ -730,6 +750,8 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / f"{entry.short_name}.json"
 
+    # The token goes to the child via REPO_EVAL_TOKEN, never on argv (§4.2).
+    token = ""
     remote_ref = resolve_remote_ref(entry, ctx)
     if remote_ref:
         platform, full_name = remote_ref
@@ -739,48 +761,25 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         else:
             token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
             repo_arg = f"gitlab:{full_name}"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
     elif entry.is_local:
-        args = [
-            str(clone_path),
-            "--platform", "local",
-            "--json",
-            "--output", str(out_json),
-        ]
+        platform, repo_arg = "local", str(clone_path)
     elif entry.platform == "github":
+        platform = "github"
         token = ctx.tokens[ctx.github_token_name]
         repo_arg = entry.full_name
-        platform = "github"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
     else:
+        platform = "gitlab"
         token = ctx.tokens[GITLAB_TOKEN_NAME]
         repo_arg = f"gitlab:{entry.full_name}"
-        platform = "gitlab"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
+
+    args = [repo_arg, "--platform", platform, "--json", "--output", str(out_json)]
+    if platform != "local":
+        args.extend(["--repo-path", str(clone_path)])
+
     code, out, err = run_py(
         EVAL_KIT / "repo_evaluator.py",
         args,
+        extra_env={"REPO_EVAL_TOKEN": token} if token else None,
         timeout=7200,
         cwd=EVAL_KIT,
     )
@@ -1054,6 +1053,25 @@ def aggregate_quality_org(ctx: RunContext, log: PipelineLogger) -> None:
     log.info(f"Quality org rollup: {org_sealed}")
 
 
+def prune_old_runs(runs_root: Path, retention_days: int, log: PipelineLogger) -> None:
+    """Delete run bundles past their retention window.
+
+    Bundles carry contributor names, per-author stats and scores. Keeping them
+    forever is the storage-limitation problem; this is the deletion path.
+    """
+    if retention_days <= 0 or not runs_root.is_dir():
+        return
+    cutoff = time.time() - retention_days * 86400
+    for run_dir in runs_root.iterdir():
+        if not run_dir.is_dir() or run_dir.stat().st_mtime >= cutoff:
+            continue
+        try:
+            shutil.rmtree(run_dir)
+            log.info(f"Retention: removed run older than {retention_days}d: {run_dir.name}")
+        except OSError as exc:
+            log.error(f"Retention: failed to remove {run_dir.name}: {exc}")
+
+
 def remove_clones(ctx: RunContext, log: PipelineLogger) -> None:
     """Delete cloned repos after processing — they are not part of deliverables."""
     if not ctx.clones_dir.exists():
@@ -1213,6 +1231,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=10, help="Parallel repo workers")
     parser.add_argument("--retries", type=int, default=3, help="Retries per repo per phase")
     parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=90,
+        help="Delete run folders older than this many days before starting "
+             "(run bundles contain contributor data; 0 disables the sweep)",
+    )
+    parser.add_argument(
         "--clone-depth",
         type=int,
         default=0,
@@ -1242,6 +1267,8 @@ def run_pipeline(include_quality_score: bool = True) -> int:
     log.info(f"Run directory: {ctx.run_dir}")
     if ctx.clones_dir != ctx.run_dir / "clones":
         log.info(f"Clones directory (short path): {ctx.clones_dir}")
+
+    prune_old_runs(ctx.run_dir.parent, args.retention_days, log)
 
     ctx.manifest = {
         "started_at": started,

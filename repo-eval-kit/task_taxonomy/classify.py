@@ -32,8 +32,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
-from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
+from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, Field
+
+try:
+    from ..llm_safety import safe_openai
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from llm_safety import safe_openai
 
 from .taxonomy import (
     DiffStats,
@@ -118,7 +124,8 @@ class TaxonomyClassifier:
         taxonomy_path: str | Path | None = None,
         concurrency: int = 32,
     ):
-        self.client = OpenAI(
+        # safe_openai, not OpenAI: this classifier sends raw git diffs.
+        self.client = safe_openai(
             api_key=api_key or os.environ.get("OPENAI_API_KEY"),
             base_url=base_url,
         )

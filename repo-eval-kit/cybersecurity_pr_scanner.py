@@ -546,7 +546,7 @@ def run_layer2_llm(
             raw=None,
         )
     try:
-        from openai import OpenAI
+        from llm_safety import safe_openai
     except ImportError:
         logger.warning("Layer2 skipped: openai package not installed")
         return Layer2Result(
@@ -579,7 +579,7 @@ Be conservative: if the change is only cosmetic or unrelated, is_security_relate
         "layer1_signals": layer1_signals,
     }
 
-    client = OpenAI(api_key=key)
+    client = safe_openai(api_key=key)
     try:
         resp = client.chat.completions.create(
             model=model,

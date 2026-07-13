@@ -622,7 +622,9 @@ class QualityEvaluator:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
         try:
             response = requests.post(
-                f"{url}?key={self.api_key}",
+                # Key travels in the header only. In the query string it lands
+                # in proxy logs, gateway logs, and shell history.
+                url,
                 headers={
                     "Content-Type": "application/json",
                     "x-goog-api-key": self.api_key,

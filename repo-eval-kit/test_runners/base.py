@@ -6,8 +6,54 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
+import os
 import subprocess
 import shutil
+
+
+# Test commands below run code from the repository under analysis (conftest.py,
+# Makefile targets, npm lifecycle scripts). That code must never see this
+# process's credentials, so the child env is default-deny: only the variables
+# needed to locate a toolchain get through. Anything not listed is dropped --
+# including GITHUB_TOKEN, GITLAB_TOKEN, OPENAI_API_KEY, AWS_*, and every other
+# secret the pipeline holds.
+_ENV_ALLOWLIST = frozenset({
+    # POSIX basics
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "PWD", "TZ",
+    "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP",
+    # Windows basics (cmd/PowerShell will not start without these)
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE", "NUMBER_OF_PROCESSORS",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA",
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+    # Toolchain roots / caches
+    "JAVA_HOME", "M2_HOME", "MAVEN_HOME", "GRADLE_HOME", "GRADLE_USER_HOME",
+    "GOPATH", "GOROOT", "GOCACHE", "GOMODCACHE",
+    "CARGO_HOME", "RUSTUP_HOME",
+    "DOTNET_ROOT", "DOTNET_CLI_HOME", "NUGET_PACKAGES",
+    "NVM_DIR", "NODE_PATH", "NPM_CONFIG_CACHE",
+    "PYENV_ROOT", "VIRTUAL_ENV", "PIP_CACHE_DIR",
+    "RBENV_ROOT", "GEM_HOME", "GEM_PATH", "BUNDLE_PATH",
+    "COMPOSER_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+})
+
+# ponytail: allowlist is deliberately conservative -- a build that needs one more
+# var fails loudly rather than leaking silently. Widen it per-run instead of
+# editing this file: F2P_ENV_PASSTHROUGH="ARTIFACTORY_URL,FOO_HOME".
+_PASSTHROUGH_VAR = "F2P_ENV_PASSTHROUGH"
+
+
+def build_child_env(overrides: Optional[dict] = None) -> dict:
+    """Environment for untrusted repo commands: allowlist only, secrets stripped."""
+    extra = {
+        name.strip()
+        for name in os.environ.get(_PASSTHROUGH_VAR, "").split(",")
+        if name.strip()
+    }
+    allowed = _ENV_ALLOWLIST | extra
+    env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
+    if overrides:
+        env.update(overrides)
+    return env
 
 
 @dataclass
@@ -242,11 +288,11 @@ class TestRunner(ABC):
     ) -> Tuple[int, str, str]:
         """
         Run a shell command and return (return_code, stdout, stderr).
+
+        The command may execute code from the repository under analysis, so it
+        runs with a credential-free allowlist env (see build_child_env).
         """
-        import os
-        full_env = os.environ.copy()
-        if env:
-            full_env.update(env)
+        full_env = build_child_env(env)
 
         try:
             result = subprocess.run(

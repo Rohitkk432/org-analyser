@@ -18,7 +18,11 @@ SECRET_PATTERNS = [
     ("Stripe Key",       r"\b[sp]k_(live|test)_[A-Za-z0-9]{16,}\b"),
     ("OpenAI Key",       r"\bsk-[A-Za-z0-9_\-]{20,}\b"),
     ("Anthropic Key",    r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
-    ("Private Key",      r"-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY"),
+    # Must span header→footer: matching only the BEGIN line leaves the key
+    # material in the text while the stats claim it was redacted.
+    ("Private Key",      r"(?s)-----BEGIN [^-\n]*PRIVATE KEY-----.*?-----END [^-\n]*PRIVATE KEY-----"),
+    ("AWS Secret Key",   r"(?i)\baws_secret_access_key\b\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?"),
+    ("Connection String", r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'\"]+:[^\s'\"@]+@[^\s'\"]+"),
     ("JWT",              r"\beyJ[A-Za-z0-9_\-]{15,}\.eyJ[A-Za-z0-9_\-]{15,}"),
     ("Hardcoded secret", r"(?i)\b(password|passwd|secret|api[_-]?key|auth[_-]?token)\b\s*[:=]\s*['\"][^'\"\s]{8,}['\"]"),
 ]
@@ -48,21 +52,29 @@ def redact_secrets(text: str, redaction_marker: str = "[REDACTED]") -> tuple[str
     redaction_counts = {}
 
     for secret_name, pattern in SECRET_PATTERNS:
-        matches = re.findall(pattern, text)
-        if matches:
-            count = len(matches) if isinstance(matches[0], str) else len([m for m in matches if m])
-            redacted_text = re.sub(
-                pattern,
-                f'"{redaction_marker}"' if '"' in redacted_text[:100] else redaction_marker,
-                redacted_text,
-                flags=re.IGNORECASE
-            )
+        # subn on the running text, not findall on the original: counts then
+        # reflect what was actually replaced, so the stats can never claim a
+        # redaction that did not happen.
+        redacted_text, count = re.subn(pattern, redaction_marker, redacted_text)
+        if count:
             redaction_counts[secret_name] = count
 
-    # Convert to list of tuples for consistent return
     redactions = [(name, count) for name, count in redaction_counts.items()]
 
     return redacted_text, redactions
+
+
+def scrub_secrets(text: str, *secrets: str, marker: str = "[REDACTED]") -> str:
+    """Strip known-literal secrets (a token, an encoded auth header) from text.
+
+    For subprocess stderr and log lines, where we know exactly which secret
+    could appear. Pattern-based redact_secrets() is the fallback for text whose
+    contents we cannot predict.
+    """
+    for secret in secrets:
+        if secret and len(secret) >= 8:  # never scrub trivially short strings
+            text = text.replace(secret, marker)
+    return text
 
 
 def redact_diff(diff_text: str) -> tuple[str, dict]:
@@ -76,31 +88,15 @@ def redact_diff(diff_text: str) -> tuple[str, dict]:
         Tuple of (redacted_diff, stats_dict)
         where stats_dict contains redaction statistics
 
-    The diff structure is preserved:
-    - Lines starting with - or + are processed for secrets
-    - Context lines and headers are kept as-is
-    - Redaction markers replace actual secret values
+    Redaction runs over the whole diff, not line by line: a PEM private key
+    spans many lines, and a per-line pass can never match it. Diff headers
+    (---/+++/@@) contain no secrets, so scanning them costs nothing.
     """
     if not diff_text:
         return diff_text, {"redacted": False, "secrets_found": 0}
 
-    lines = diff_text.split('\n')
-    redacted_lines = []
-    total_redactions = {}
-
-    for line in lines:
-        # Process only diff content lines (those starting with +/- for added/removed code)
-        if line.startswith(('+', '-')) and not line.startswith(('+++', '---')):
-            redacted_line, redactions = redact_secrets(line)
-            # Track which secrets were found
-            for secret_type, count in redactions:
-                total_redactions[secret_type] = total_redactions.get(secret_type, 0) + count
-            redacted_lines.append(redacted_line)
-        else:
-            # Keep context/header lines unchanged
-            redacted_lines.append(line)
-
-    redacted_diff = '\n'.join(redacted_lines)
+    redacted_diff, redactions = redact_secrets(diff_text)
+    total_redactions = dict(redactions)
 
     stats = {
         "redacted": len(total_redactions) > 0,

@@ -27,9 +27,9 @@ def _get_openai_client():
         logger.warning("No OPENAI_API_KEY found — LLM analysis will be skipped")
         return None
     try:
-        from openai import OpenAI
+        from llm_safety import safe_openai
 
-        return OpenAI(api_key=api_key)
+        return safe_openai(api_key=api_key)
     except ImportError:
         logger.warning("openai package not installed — LLM analysis will be skipped")
         return None
