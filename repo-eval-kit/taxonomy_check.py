@@ -352,10 +352,12 @@ def run_taxonomy_for_accepted_prs(
     if skip_taxonomy:
         return dict(_EMPTY_RESULT), empty_per_pr
 
+    from llm_safety import llm_available
+
     api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
+    if not llm_available():
         logger.warning(
-            "No OPENAI_API_KEY found — taxonomy classification will be skipped"
+            "No LLM configured (OpenAI or Azure) — taxonomy classification will be skipped"
         )
         return dict(_EMPTY_RESULT), empty_per_pr
 

@@ -536,17 +536,8 @@ def run_layer2_llm(
     model: str,
 ) -> Optional[Layer2Result]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        logger.warning("Layer2 skipped: OPENAI_API_KEY not set")
-        return Layer2Result(
-            is_security_related=False,
-            confidence="none",
-            categories=[],
-            rationale="OPENAI_API_KEY not set",
-            raw=None,
-        )
     try:
-        from openai import OpenAI
+        from llm_safety import llm_available, safe_openai
     except ImportError:
         logger.warning("Layer2 skipped: openai package not installed")
         return Layer2Result(
@@ -554,6 +545,15 @@ def run_layer2_llm(
             confidence="none",
             categories=[],
             rationale="openai package not installed",
+            raw=None,
+        )
+    if not llm_available():
+        logger.warning("Layer2 skipped: no LLM configured (OpenAI or Azure)")
+        return Layer2Result(
+            is_security_related=False,
+            confidence="none",
+            categories=[],
+            rationale="no LLM configured",
             raw=None,
         )
 
@@ -579,7 +579,7 @@ Be conservative: if the change is only cosmetic or unrelated, is_security_relate
         "layer1_signals": layer1_signals,
     }
 
-    client = OpenAI(api_key=key)
+    client = safe_openai(api_key=key)
     try:
         resp = client.chat.completions.create(
             model=model,

@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -112,8 +113,33 @@ def resolve_clones_dir(run_dir: Path) -> Path:
 
 sys.path.insert(0, str(CODING))
 sys.path.insert(0, str(PROFILER_ROOT))
+sys.path.insert(0, str(EVAL_KIT))
+
+# Load .env so LLM credentials (OPENAI_API_KEY or the AZURE_OPENAI_* set) are
+# in the environment and propagate to every child process the pipeline spawns.
+try:
+    from dotenv import load_dotenv  # noqa: E402
+
+    load_dotenv()
+except ImportError:
+    pass
+
+# Make git incapable of blocking on a human, whatever the host is configured
+# with. A bad/absent token must fail fast, never hang the pipeline:
+#   GIT_TERMINAL_PROMPT=0  -> no terminal username/password prompt
+#   GIT_ASKPASS=echo       -> the askpass fallback returns instantly (no dialog)
+#   GCM_INTERACTIVE=never  -> Git Credential Manager won't pop a GUI
+# The osxkeychain/manager helpers, if configured, then just fail to supply a
+# credential and git errors out -- fast and logged, not frozen.
+for _k, _v in (
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", "echo"),
+    ("GCM_INTERACTIVE", "never"),
+):
+    os.environ.setdefault(_k, _v)
 
 from count_merged_prs import list_github_repos, list_gitlab_projects  # noqa: E402
+from credential_redactor import scrub_secrets  # noqa: E402
 from export_all_merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
@@ -126,6 +152,14 @@ from export_all_merged_prs import (  # noqa: E402
 GITHUB_TOKEN_NAME = "github-data-token"
 GITLAB_TOKEN_NAME = "gitlab_token"
 OPENAI_TOKEN_NAMES = ("openai_key", "OPENAI_API_KEY")
+# Azure AI Foundry / Azure OpenAI settings the tokens file may carry; promoted
+# into the environment at startup (see build_run_context validation).
+AZURE_TOKEN_NAMES = (
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "OPENAI_API_VERSION",
+)
 
 
 @dataclass
@@ -171,6 +205,8 @@ class RunContext:
     workers: int
     retries: int
     clone_depth: int | None
+    skip_f2p: bool
+    local_only: bool
     github_host: str
     gitlab_host: str
     github_token_name: str
@@ -225,6 +261,18 @@ def parse_tokens_file(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         tokens[key.strip()] = value.strip()
     return tokens
+
+
+def azure_configured() -> bool:
+    """True when Azure AI Foundry / Azure OpenAI is set up in the environment.
+
+    In this mode the LLM clients (llm_safety.safe_openai, quality_evaluator)
+    authenticate against Azure and no OpenAI key is required.
+    """
+    return bool(
+        os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        and os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+    )
 
 
 def resolve_openai_key(tokens: dict[str, str]) -> str | None:
@@ -329,6 +377,11 @@ def parse_git_remote(repo_path: Path) -> tuple[str, str] | None:
 
 def resolve_remote_ref(entry: RepoEntry, ctx: RunContext) -> tuple[str, str] | None:
     """Map a local folder entry to (platform, full_name) for optional API-backed phases."""
+    # local-only: never resolve a remote, even if the checkout has an `origin`.
+    # This keeps the PR-based phases skipped and eval-kit in local mode, instead
+    # of trying (and failing) to hit GitHub/GitLab without a token.
+    if ctx.local_only:
+        return None
     manifest_ref = ctx.repos_manifest.get(entry.short_name, "").strip()
     if manifest_ref:
         if manifest_ref.startswith("gitlab:"):
@@ -347,6 +400,21 @@ def discover_local_repos(ctx: RunContext, log: PipelineLogger) -> list[RepoEntry
     root = ctx.local_repos_dir
     if not root or not root.is_dir():
         raise RuntimeError(f"Local repos directory not found: {root}")
+
+    # If the path is itself a repo (has .git), treat it as a single repo rather
+    # than a parent folder of repos. Lets --local-repos-dir accept either.
+    if (root / ".git").exists():
+        full_name = ctx.repos_manifest.get(root.name) or f"local/{root.name}"
+        log.info(f"Local single-repo mode: {root}")
+        return [
+            RepoEntry(
+                platform="local",
+                full_name=full_name,
+                org=ctx.target,
+                batch_org=ctx.target,
+                local_path=root.resolve(),
+            )
+        ]
 
     entries: list[RepoEntry] = []
     for child in sorted(root.iterdir()):
@@ -394,13 +462,23 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         errors.append(f"Cannot run Python interpreter {PYTHON_BIN}: {exc}")
 
+    # Let the tokens file carry Azure settings too, so it stays the single
+    # place for credentials. A real environment value always wins over the
+    # tokens file. Promoted here so validation and every child process see them.
+    for name in AZURE_TOKEN_NAMES:
+        val = ctx.tokens.get(name, "").strip()
+        if val and not os.environ.get(name, "").strip():
+            os.environ[name] = val
+
     openai_key = resolve_openai_key(ctx.tokens)
-    if not openai_key:
-        errors.append(
-            "Missing OpenAI API key: set OPENAI_API_KEY or openai_key= in tokens file"
-        )
-    else:
+    if openai_key:
         os.environ["OPENAI_API_KEY"] = openai_key
+    elif not azure_configured():
+        errors.append(
+            "Missing LLM credentials: set OPENAI_API_KEY (or openai_key= in the "
+            "tokens file), or configure Azure with AZURE_OPENAI_ENDPOINT + "
+            "AZURE_OPENAI_API_KEY"
+        )
 
     if ctx.platform in ("github", "github-repo"):
         if not ctx.tokens.get(ctx.github_token_name):
@@ -589,17 +667,22 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
     cmd.extend([clone_url(entry, ctx.tokens, ctx), str(dest)])
 
     env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
-    # Pass token via environment variable instead of embedding in URL
+    # Auth via git's env-config channel. GIT_ASKPASS_OVERRIDE and
+    # GIT_HTTP_EXTRAHEADER (used here previously) are not git variables at all
+    # -- git never read them, so private clones were silently falling back to
+    # whatever ambient credential helper the host happened to have.
+    # GIT_CONFIG_COUNT/KEY/VALUE is the real mechanism, and unlike `-c` it keeps
+    # the token off argv.
+    token = ""
     if entry.platform == "github":
         token = ctx.tokens.get(ctx.github_token_name, "")
-        if token:
-            env["GIT_ASKPASS_OVERRIDE"] = token
-            env["GIT_HTTP_EXTRAHEADER"] = f"AUTHORIZATION: basic {__import__('base64').b64encode((f':{token}').encode()).decode()}"
     elif entry.platform == "gitlab":
         token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
-        if token:
-            env["GIT_ASKPASS_OVERRIDE"] = token
-            env["GIT_HTTP_EXTRAHEADER"] = f"PRIVATE-TOKEN: {token}"
+    if token:
+        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
@@ -607,15 +690,20 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
         return False, "clone timeout", None
     if proc.returncode != 0:
         err_msg = (proc.stderr or proc.stdout or "")[-800:]
-        # Sanitize error message to remove any accidentally exposed tokens
-        err_msg = err_msg.replace(ctx.tokens.get(ctx.github_token_name, ""), "[REDACTED]")
-        err_msg = err_msg.replace(ctx.tokens.get(GITLAB_TOKEN_NAME, ""), "[REDACTED]")
+        # scrub_secrets ignores empty/short strings; a bare str.replace("", ...)
+        # on a missing token would splice the marker between every character.
+        err_msg = scrub_secrets(
+            err_msg,
+            ctx.tokens.get(ctx.github_token_name, ""),
+            ctx.tokens.get(GITLAB_TOKEN_NAME, ""),
+        )
         return False, err_msg, None
 
     verify = subprocess.run(
         ["git", *git_longpath_config(), "-C", str(dest), "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
+        timeout=60,
     )
     if verify.returncode != 0:
         shutil.rmtree(dest, ignore_errors=True)
@@ -639,8 +727,16 @@ def run_py(
     args: list[str],
     timeout: int = 900,
     cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
-    """Run a Python script; return (exit_code, stdout, stderr)."""
+    """Run a Python script; return (exit_code, stdout, stderr).
+
+    Pass secrets through extra_env, never through args: argv is world-readable
+    via `ps` and /proc/<pid>/cmdline.
+    """
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.run(
             [PYTHON_BIN, str(script), *args],
@@ -648,7 +744,7 @@ def run_py(
             text=True,
             timeout=timeout,
             cwd=str(cwd) if cwd else None,
-            env=os.environ.copy(),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return 1, "", "timeout"
@@ -730,6 +826,8 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / f"{entry.short_name}.json"
 
+    # The token goes to the child via REPO_EVAL_TOKEN, never on argv (§4.2).
+    token = ""
     remote_ref = resolve_remote_ref(entry, ctx)
     if remote_ref:
         platform, full_name = remote_ref
@@ -739,48 +837,27 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         else:
             token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
             repo_arg = f"gitlab:{full_name}"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
     elif entry.is_local:
-        args = [
-            str(clone_path),
-            "--platform", "local",
-            "--json",
-            "--output", str(out_json),
-        ]
+        platform, repo_arg = "local", str(clone_path)
     elif entry.platform == "github":
+        platform = "github"
         token = ctx.tokens[ctx.github_token_name]
         repo_arg = entry.full_name
-        platform = "github"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
     else:
+        platform = "gitlab"
         token = ctx.tokens[GITLAB_TOKEN_NAME]
         repo_arg = f"gitlab:{entry.full_name}"
-        platform = "gitlab"
-        args = [
-            repo_arg,
-            "--token", token,
-            "--platform", platform,
-            "--repo-path", str(clone_path),
-            "--json",
-            "--output", str(out_json),
-        ]
+
+    args = [repo_arg, "--platform", platform, "--json", "--output", str(out_json)]
+    if platform != "local":
+        args.extend(["--repo-path", str(clone_path)])
+    if ctx.skip_f2p:
+        args.append("--skip-f2p")
+
     code, out, err = run_py(
         EVAL_KIT / "repo_evaluator.py",
         args,
+        extra_env={"REPO_EVAL_TOKEN": token} if token else None,
         timeout=7200,
         cwd=EVAL_KIT,
     )
@@ -1054,6 +1131,25 @@ def aggregate_quality_org(ctx: RunContext, log: PipelineLogger) -> None:
     log.info(f"Quality org rollup: {org_sealed}")
 
 
+def prune_old_runs(runs_root: Path, retention_days: int, log: PipelineLogger) -> None:
+    """Delete run bundles past their retention window.
+
+    Bundles carry contributor names, per-author stats and scores. Keeping them
+    forever is the storage-limitation problem; this is the deletion path.
+    """
+    if retention_days <= 0 or not runs_root.is_dir():
+        return
+    cutoff = time.time() - retention_days * 86400
+    for run_dir in runs_root.iterdir():
+        if not run_dir.is_dir() or run_dir.stat().st_mtime >= cutoff:
+            continue
+        try:
+            shutil.rmtree(run_dir)
+            log.info(f"Retention: removed run older than {retention_days}d: {run_dir.name}")
+        except OSError as exc:
+            log.error(f"Retention: failed to remove {run_dir.name}: {exc}")
+
+
 def remove_clones(ctx: RunContext, log: PipelineLogger) -> None:
     """Delete cloned repos after processing — they are not part of deliverables."""
     if not ctx.clones_dir.exists():
@@ -1119,6 +1215,14 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         Path(args.repos_manifest).expanduser().resolve() if args.repos_manifest else None
     )
 
+    # local-only: explicit flag, or auto for local repos with no repos-manifest.
+    # A manifest is the explicit "map these folders to remotes" signal; without
+    # one, a local run is pure-local. This keeps a leftover `origin` remote from
+    # dragging the PR-based phases into tokenless API calls that just fail. A
+    # stray env token is deliberately NOT the trigger -- intent is, not ambient
+    # credentials.
+    local_only = args.local_only or (platform == "local" and not repos_manifest)
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if platform == "gitlab-project" and len(gitlab_projects) > 1:
         run_label = f"gitlab-projects-{len(gitlab_projects)}"
@@ -1148,6 +1252,8 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         workers=args.workers,
         retries=args.retries,
         clone_depth=args.clone_depth if args.clone_depth > 0 else None,
+        skip_f2p=args.skip_f2p,
+        local_only=local_only,
         github_host=args.github_host,
         gitlab_host=args.gitlab_host,
         github_token_name=args.github_token_name,
@@ -1213,10 +1319,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=10, help="Parallel repo workers")
     parser.add_argument("--retries", type=int, default=3, help="Retries per repo per phase")
     parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=90,
+        help="Delete run folders older than this many days before starting "
+             "(run bundles contain contributor data; 0 disables the sweep)",
+    )
+    parser.add_argument(
         "--clone-depth",
         type=int,
         default=0,
         help="Git clone depth (0 = full clone, default)",
+    )
+    parser.add_argument(
+        "--skip-f2p",
+        action="store_true",
+        help="Skip F2P/P2P test verification in eval-kit (the slowest phase: it "
+             "installs deps and runs the test suite per accepted PR). Recommended "
+             "for large repos.",
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Never contact a remote API. Runs only the code-based analyses on "
+             "local checkouts and skips PR-based phases, even if a checkout still "
+             "has an 'origin' remote. Auto-enabled with --local-repos-dir when no "
+             "token is available.",
     )
     parser.add_argument("--github-host", default="github.com")
     parser.add_argument("--gitlab-host", default="gitlab.com")
@@ -1238,10 +1366,14 @@ def run_pipeline(include_quality_score: bool = True) -> int:
     started = datetime.now(timezone.utc).isoformat()
     log.info(f"Starting org pipeline: {ctx.platform}={ctx.target}")
     log.info(f"Include repo-quality-score: {ctx.include_quality_score}")
+    if ctx.local_only:
+        log.info("Local-only mode: code-based analyses only, PR/remote phases skipped.")
     log.info(f"Python: {PYTHON_BIN}")
     log.info(f"Run directory: {ctx.run_dir}")
     if ctx.clones_dir != ctx.run_dir / "clones":
         log.info(f"Clones directory (short path): {ctx.clones_dir}")
+
+    prune_old_runs(ctx.run_dir.parent, args.retention_days, log)
 
     ctx.manifest = {
         "started_at": started,

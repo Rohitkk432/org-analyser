@@ -31,6 +31,7 @@ repos; commit and tag counts are the host-agnostic activity proxy instead.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -170,6 +171,18 @@ def is_git_repo(repo: Path) -> bool:
 def is_bot_author(name: str, email: str) -> bool:
     haystack = f"{name} {email}"
     return any(p.search(haystack) for p in BOT_NAME_PATTERNS)
+
+
+def pseudonymize(email: str) -> str:
+    """Stable pseudonym for a committer address.
+
+    Same address always yields the same id, so contributor counts and
+    cross-repo joins are unchanged; the address itself never leaves the host.
+    """
+    if not email:
+        return ""
+    digest = hashlib.sha256(email.strip().lower().encode()).hexdigest()
+    return f"anon:{digest[:16]}"
 
 
 def matches_any(path: str, patterns: list[re.Pattern]) -> bool:
@@ -449,8 +462,18 @@ def aggregate_repo_stats(repo: Path) -> dict:
         "tag_count": len(tag_lines),
         "semver_tag_count": semver_tags,
         "latest_tag": latest_tag,
+        # author_id, not email. Bot detection already ran against the real
+        # address (is_bot below), and nothing downstream reads the address
+        # itself -- so emitting it would put developer PII in the deliverable
+        # for no analytical gain. The hash is stable, so authors can still be
+        # deduplicated and joined across repos and across runs.
         "top_authors": [
-            {"name": a["name"], "email": a["email"], "commits": a["commits"], "is_bot": a["is_bot"]}
+            {
+                "name": a["name"],
+                "author_id": pseudonymize(a["email"]),
+                "commits": a["commits"],
+                "is_bot": a["is_bot"],
+            }
             for a in authors[:15]
         ],
     }

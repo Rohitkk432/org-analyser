@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 try:
-    from .credential_redactor import redact_diff, redaction_summary
+    from .credential_redactor import redact_diff, redact_secrets, redaction_summary
 except ImportError:  # invoked as a top-level script (cwd=repo-eval-kit)
-    from credential_redactor import redact_diff, redaction_summary
+    from credential_redactor import redact_diff, redact_secrets, redaction_summary
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +387,12 @@ class QualityEvaluator:
         if self.llm_provider == "gemini":
             return os.environ.get("GEMINI_API_KEY", "")
         elif self.llm_provider == "openai":
-            return os.environ.get("OPENAI_API_KEY", "")
+            # Azure key wins when configured, so the OpenAI provider path talks
+            # to Azure Foundry with no other change (see _call_openai).
+            return (
+                os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+                or os.environ.get("OPENAI_API_KEY", "")
+            )
         return ""
 
 
@@ -605,6 +610,15 @@ class QualityEvaluator:
         if not self.api_key:
             logger.error(f"No API key configured for {self.llm_provider}")
             return None
+
+        # Redact the whole prompt at the single send choke point, so no secret
+        # in any interpolated field (diffs, commit messages, problem statements)
+        # reaches the provider. Diffs are already redacted upstream; this is the
+        # backstop for everything else, matching the SDK client-boundary guard.
+        prompt, found = redact_secrets(prompt)
+        if found:
+            logger.info("Redacted %d secret(s) from prompt before LLM call", sum(n for _, n in found))
+
         try:
             if self.llm_provider == "gemini":
                 return self._call_gemini(prompt)
@@ -622,7 +636,9 @@ class QualityEvaluator:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
         try:
             response = requests.post(
-                f"{url}?key={self.api_key}",
+                # Key travels in the header only. In the query string it lands
+                # in proxy logs, gateway logs, and shell history.
+                url,
                 headers={
                     "Content-Type": "application/json",
                     "x-goog-api-key": self.api_key,
@@ -642,13 +658,32 @@ class QualityEvaluator:
     def _call_openai(self, prompt: str) -> Optional[str]:
         import requests
 
+        # Azure AI Foundry when AZURE_OPENAI_ENDPOINT is set, OpenAI otherwise.
+        # Azure addresses the model by deployment in the URL and authenticates
+        # with an `api-key` header instead of a bearer token.
+        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        if azure_endpoint:
+            deployment = (
+                os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
+                or self.openai_model
+            )
+            api_version = os.environ.get("OPENAI_API_VERSION", "2024-10-21")
+            url = (
+                f"{azure_endpoint.rstrip('/')}/openai/deployments/{deployment}"
+                f"/chat/completions?api-version={api_version}"
+            )
+            headers = {"Content-Type": "application/json", "api-key": self.api_key}
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
+
         try:
             response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                },
+                url,
+                headers=headers,
                 json={
                     "model": self.openai_model,
                     "messages": [

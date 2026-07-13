@@ -82,6 +82,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+# Shared redacting OpenAI client. This script sends PR titles, bodies and human
+# review comments, so it must not construct a bare OpenAI() client.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "repo-eval-kit"))
+from llm_safety import llm_available, safe_openai  # noqa: E402
+
 try:
     from dotenv import load_dotenv
 
@@ -376,7 +381,24 @@ def github_graphql(
         if response.status_code >= 400:
             raise RuntimeError(f"GitHub API error: {response.status_code}")
 
-        payload = response.json()
+        # A 2xx with an empty or non-JSON body is GitHub load-shedding / secondary
+        # rate-limiting (common on large repos mid-pagination). Treat it as
+        # transient and retry, rather than crashing the whole phase on .json().
+        try:
+            payload = response.json()
+        except ValueError:
+            wait = min(2 ** attempt, 60)
+            last_err = (
+                f"non-JSON body (HTTP {response.status_code}, "
+                f"{len(response.content)} bytes): {response.text[:120]!r}"
+            )
+            logger.warning(
+                "GitHub returned a non-JSON body (status %s, %d bytes). "
+                "Retrying in %ss (attempt %d/%d).",
+                response.status_code, len(response.content), wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
         if "errors" in payload:
             errors = payload["errors"]
             if any(err.get("type") == "RATE_LIMITED" for err in errors):
@@ -806,7 +828,19 @@ def github_rest_get(
         if response.status_code >= 400:
             raise RuntimeError(f"GitHub REST error: {response.status_code}")
 
-        return response.json()
+        if response.status_code == 204 or not response.text:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            wait = min(2 ** attempt, 60)
+            last_err = f"non-JSON body (HTTP {response.status_code}): {response.text[:120]!r}"
+            logger.warning(
+                "GitHub REST returned a non-JSON body (status %s). Retrying in %ss "
+                "(attempt %d/%d).", response.status_code, wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
 
     raise RuntimeError(f"GitHub REST failed after {max_retries} retries. Last error: {last_err}")
 
@@ -1227,6 +1261,40 @@ def build_llm_input(sig: Dict[str, Any], body_text: str) -> Dict[str, Any]:
     }
 
 
+def _llm_preflight(client: Any, model: str) -> None:
+    """One test call before classifying thousands of PRs.
+
+    A configuration error (bad key, unknown model, wrong Azure deployment or
+    api-version) aborts the phase immediately with a clear message, instead of
+    surfacing as a per-PR failure repeated across the whole repo. Transient
+    errors (rate limit, timeout, 5xx) are not fatal here -- the per-PR retry
+    loop handles those -- so we only abort on 4xx config-class statuses.
+    """
+    try:
+        client.chat.completions.create(
+            model=model,
+            temperature=0,
+            max_tokens=5,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        logger.info("LLM preflight OK (model=%s).", model)
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "status_code", None)
+        if status in (400, 401, 403, 404):
+            raise SystemExit(
+                f"LLM preflight failed [{status} {type(exc).__name__}]: {exc}\n"
+                "The LLM is misconfigured. Check the model/deployment name and "
+                "API key; for Azure, verify AZURE_OPENAI_ENDPOINT, "
+                "AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT and "
+                "OPENAI_API_VERSION. Aborting before classifying PRs so you don't "
+                "get thousands of failed calls and an all-'error' report."
+            )
+        logger.warning(
+            "LLM preflight hit a non-fatal error (%s: %s); proceeding, per-PR "
+            "retries will handle transient issues.", type(exc).__name__, exc,
+        )
+
+
 def classify_with_llm(
     client: Any,
     model: str,
@@ -1286,9 +1354,7 @@ def process_prs(
     client: Any = None,
 ) -> List[Dict[str, Any]]:
     if client is None:
-        from openai import OpenAI
-
-        client = OpenAI()
+        client = safe_openai()
 
     logger.info("Extracting deterministic signals for %d PRs...", len(prs))
     signals = [extract_signals(pr) for pr in prs]
@@ -1297,6 +1363,14 @@ def process_prs(
 
     bot_count = sum(1 for s in signals if s["author_is_bot"])
     logger.info("Signals ready. %d bot-authored PRs will skip the LLM.", bot_count)
+
+    # Fail fast on a misconfigured LLM. Without this, a wrong key/model/Azure
+    # deployment makes EVERY non-bot PR fail its 3 retries and get logged as an
+    # error -- hours of noise on a large repo, ending in an all-"error" CSV that
+    # looks like success. One test call turns that into a clear abort in seconds.
+    if bot_count < len(prs):
+        _llm_preflight(client, model)
+
     logger.info("Running LLM classification with model=%s, workers=%d...", model, max_workers)
 
     def worker(idx: int) -> Tuple[int, Dict[str, Any]]:
@@ -1664,8 +1738,12 @@ def main() -> None:
     if has_gitlab and not gitlab_token:
         logger.error("GITLAB_TOKEN is not set (env or .env). Aborting.")
         sys.exit(1)
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.error("OPENAI_API_KEY is not set (env or .env). The LLM pass is required. Aborting.")
+    if not llm_available():
+        logger.error(
+            "No LLM configured. Set OPENAI_API_KEY, or Azure "
+            "(AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY). The LLM pass is "
+            "required. Aborting."
+        )
         sys.exit(1)
 
     scan_targets: List[Tuple[str, str]] = []  # (platform, repo_or_project)
@@ -1707,9 +1785,7 @@ def main() -> None:
         logger.info("  - [%s] %s", platform, name)
 
     # One OpenAI client shared across all repos.
-    from openai import OpenAI
-
-    client = OpenAI()
+    client = safe_openai()
 
     all_rows: List[Dict[str, Any]] = []
     per_repo_summaries: Dict[str, Any] = {}

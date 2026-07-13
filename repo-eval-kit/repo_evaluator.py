@@ -35,6 +35,7 @@ Examples:
 """
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
@@ -51,6 +52,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from .credential_redactor import scrub_secrets
+except ImportError:
+    from credential_redactor import scrub_secrets
 
 try:
     from .constants import (
@@ -3793,17 +3799,59 @@ def checkout_svn_repo(
     return dest
 
 
+def _install_git_auth(platform: str, token: str) -> None:
+    """Authenticate every git subprocess in this process via git's env-config.
+
+    Setting these in os.environ (not per-command) means the clone AND every
+    follow-up fetch -- F2P PR-ref fetches, commit fetches -- inherit the
+    credential automatically, without embedding the token in the URL or writing
+    it to .git/config. The header is scoped to the platform host so the token is
+    never sent anywhere else. GIT_TERMINAL_PROMPT=0 ensures a failed fetch errors
+    out instead of blocking on an interactive username/password prompt.
+    """
+    # Belt-and-suspenders so no git op in this process can block on a human,
+    # regardless of the host's credential-helper config.
+    os.environ["GIT_TERMINAL_PROMPT"] = "0"
+    os.environ.setdefault("GIT_ASKPASS", "echo")
+    os.environ.setdefault("GCM_INTERACTIVE", "never")
+    if not token:
+        return
+    host = {"gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}.get(platform, "github.com")
+    auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    os.environ["GIT_CONFIG_COUNT"] = "1"
+    os.environ["GIT_CONFIG_KEY_0"] = f"http.https://{host}/.extraHeader"
+    os.environ["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
+
+
 def clone_repo(
     repo_full_name: str, temp_dir: Path, token: str, platform: str = "github"
 ) -> Path:
-    """Clone repository to temporary directory."""
+    """Clone repository to temporary directory.
 
-    if platform == "bitbucket":
-        repo_url = f"https://x-token-auth:{token}@bitbucket.org/{repo_full_name}.git"
-    elif platform == "gitlab":
-        repo_url = f"https://oauth2:{token}@gitlab.com/{repo_full_name}.git"
-    else:  # default to github
-        repo_url = f"https://{token}@github.com/{repo_full_name}.git"
+    The token is supplied as an HTTP auth header through git's env-config
+    mechanism (GIT_CONFIG_*), so it appears in neither the URL nor argv:
+
+    - a tokenised URL is persisted verbatim into <clone>/.git/config as
+      remote.origin.url, and echoed back by git's own auth-failure messages;
+    - `git -c http.extraHeader=...` would put it on argv, readable via `ps`.
+
+    GIT_CONFIG_COUNT/KEY/VALUE is the only channel that leaks through neither.
+    """
+    host = {
+        "bitbucket": "bitbucket.org",
+        "gitlab": "gitlab.com",
+    }.get(platform, "github.com")
+    repo_url = f"https://{host}/{repo_full_name}.git"
+
+    env = os.environ.copy()
+    auth = ""
+    if token:
+        # Basic auth, token as the password. The username is ignored by all
+        # three providers but must be present.
+        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
 
     clone_path = temp_dir / repo_full_name.replace("/", "_")
 
@@ -3814,10 +3862,13 @@ def clone_repo(
         capture_output=True,
         text=True,
         timeout=900,  # 15 minutes for large repos
+        env=env,
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to clone repository: {result.stderr}")
+        raise RuntimeError(
+            f"Failed to clone repository: {scrub_secrets(result.stderr, token, auth)}"
+        )
 
     logger.info(f"Successfully cloned repository")
     return clone_path
@@ -4018,10 +4069,13 @@ def main():
     platform = detect_platform(args.repo, args.platform)
     logger.info(f"Detected platform: {platform}")
 
-    # Get token (prefer --token, fallback to --github-token for backward compatibility)
-    token = args.token or args.github_token
+    # Prefer REPO_EVAL_TOKEN from the environment: command-line arguments are
+    # world-readable via `ps` / /proc/<pid>/cmdline and get slurped by process
+    # monitors. --token still works for interactive use and back-compat.
+    token = os.environ.get("REPO_EVAL_TOKEN", "") or args.token or args.github_token
     if not token and platform not in ("local",):
         logger.warning("No token provided. API rate limits may apply.")
+    _install_git_auth(platform, token)
 
     svn_url = ""
     svn_user = args.svn_username or os.environ.get("SVN_USERNAME")

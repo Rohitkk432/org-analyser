@@ -2,4 +2,16 @@
 
 github-data-token=ghp_your_github_token_here
 gitlab_token=glpat_your_gitlab_token_here
+
+# ── LLM provider ──────────────────────────────────────────────────────────────
+# Use EITHER OpenAI directly, OR Azure AI Foundry / Azure OpenAI.
+
+# Option A — OpenAI directly:
 openai_key=sk-your_openai_key_here
+
+# Option B — Azure AI Foundry / Azure OpenAI (leave openai_key blank if using this).
+# When AZURE_OPENAI_ENDPOINT is set, every LLM call routes to Azure instead.
+# AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+# AZURE_OPENAI_API_KEY=your_azure_api_key_here
+# AZURE_OPENAI_DEPLOYMENT=your_deployment_name   # only if it differs from the model name
+# OPENAI_API_VERSION=2024-10-21                  # optional; this is the default

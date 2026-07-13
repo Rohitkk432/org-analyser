@@ -21,18 +21,17 @@ logger = logging.getLogger(__name__)
 
 
 def _get_openai_client():
-    """Create an OpenAI client from the OPENAI_API_KEY env var (loaded via .env)."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        logger.warning("No OPENAI_API_KEY found — LLM analysis will be skipped")
-        return None
+    """Redacting LLM client from the environment (OpenAI or Azure)."""
     try:
-        from openai import OpenAI
-
-        return OpenAI(api_key=api_key)
+        from llm_safety import llm_available, safe_openai
     except ImportError:
         logger.warning("openai package not installed — LLM analysis will be skipped")
         return None
+    if not llm_available():
+        logger.warning("No LLM configured (OpenAI or Azure) — LLM analysis will be skipped")
+        return None
+    # api_key is ignored on the Azure path (safe_openai reads AZURE_OPENAI_API_KEY).
+    return safe_openai(api_key=os.getenv("OPENAI_API_KEY", "") or None)
 
 
 def run_vibe_coding_check(
