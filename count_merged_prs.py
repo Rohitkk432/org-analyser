@@ -113,15 +113,15 @@ def in_range(dt_str: str | None, since: datetime | None, until: datetime | None)
 
 
 def bitbucket_headers(token: str, username: str = "") -> dict[str, str]:
+    headers = {"Accept": "application/json", "User-Agent": "count-merged-prs"}
+    if not token:
+        return headers  # anonymous: fine for public repos (lower rate limit)
     # App password -> username:token; workspace/repo access token ->
     # x-bitbucket-api-token-auth:token. Both are HTTP Basic.
     user = username.strip() or "x-bitbucket-api-token-auth"
     creds = base64.b64encode(f"{user}:{token}".encode()).decode()
-    return {
-        "Accept": "application/json",
-        "Authorization": f"Basic {creds}",
-        "User-Agent": "count-merged-prs",
-    }
+    headers["Authorization"] = f"Basic {creds}"
+    return headers
 
 
 def paginate_bitbucket(url: str, token: str, username: str = "") -> list[Any]:

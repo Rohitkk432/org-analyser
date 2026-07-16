@@ -521,8 +521,13 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
                         f"GitHub repo path must be owner/repo (got {repo!r})"
                     )
     elif ctx.platform in ("bitbucket", "bitbucket-repo"):
-        if not ctx.tokens.get(BITBUCKET_TOKEN_NAME):
-            errors.append(f"Missing {BITBUCKET_TOKEN_NAME} in tokens file")
+        # A token is optional for public repos (anonymous access, lower rate
+        # limit). Listing a whole workspace does need one, though.
+        if ctx.platform == "bitbucket" and not ctx.tokens.get(BITBUCKET_TOKEN_NAME):
+            errors.append(
+                f"Missing {BITBUCKET_TOKEN_NAME} in tokens file "
+                "(required to list a workspace; a single public --bitbucket-repo can omit it)"
+            )
         if ctx.platform == "bitbucket-repo":
             for repo in ctx.bitbucket_repos:
                 if "/" not in repo:
@@ -658,7 +663,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
         )
     elif ctx.platform == "bitbucket":
         summary = export_bitbucket_workspace(
-            ctx.tokens[BITBUCKET_TOKEN_NAME],
+            ctx.tokens.get(BITBUCKET_TOKEN_NAME, ""),
             ctx.target,
             BITBUCKET_TOKEN_NAME,
             ctx.merged_pr_dir,
@@ -666,7 +671,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
         )
     elif ctx.platform == "bitbucket-repo":
         summary = export_bitbucket_repos(
-            ctx.tokens[BITBUCKET_TOKEN_NAME],
+            ctx.tokens.get(BITBUCKET_TOKEN_NAME, ""),
             ctx.bitbucket_repos,
             BITBUCKET_TOKEN_NAME,
             ctx.merged_pr_dir,

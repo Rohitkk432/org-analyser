@@ -795,10 +795,11 @@ def bitbucket_rest_get(
 ) -> Any:
     """GET an absolute Bitbucket URL, with the same retry discipline as GitLab."""
     headers = {
-        "Authorization": _bitbucket_auth_header(token, username),
         "Accept": "application/json",
         "User-Agent": "pr_task_profile_report",
     }
+    if token:  # anonymous when absent: works for public repos (lower rate limit)
+        headers["Authorization"] = _bitbucket_auth_header(token, username)
     last_err: Optional[str] = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -1988,8 +1989,7 @@ def main() -> None:
         logger.error("GITLAB_TOKEN is not set (env or .env). Aborting.")
         sys.exit(1)
     if has_bitbucket and not bitbucket_token:
-        logger.error("BITBUCKET_TOKEN is not set (env or .env). Aborting.")
-        sys.exit(1)
+        logger.warning("BITBUCKET_TOKEN not set — using anonymous Bitbucket access (public repos only, low rate limit).")
     if not llm_available():
         logger.error(
             "No LLM configured. Set OPENAI_API_KEY, or Azure "
