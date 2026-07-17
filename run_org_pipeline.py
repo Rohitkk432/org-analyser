@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -42,6 +43,10 @@ QUALITY_AGENT = CODING / "outputs" / "repo-quality-score-agent"
 SIGNAL_SCORER_DIR = CODING / "outputs" / "repo-quality-score"
 TASK_PROFILE_SCRIPT = CODING / "pr_task_profile_report.py"
 REPO_ANALYZER_SCRIPT = CODING / "repo_analyzer.py"
+
+# All per-repo profiler rows append to one shared workbook; the per-repo phases
+# run concurrently, so writes to it must be serialised (see run_profiler).
+_PROFILER_WRITE_LOCK = threading.Lock()
 
 def active_venv_python_candidates() -> list[str]:
     venv = os.environ.get("VIRTUAL_ENV", "").strip()
@@ -898,7 +903,12 @@ def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
             originating_company=entry.org,
             repo_name=entry.repo_slug,
         )
-        append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
+        # Per-repo phases run in a thread pool but every profiler row lands in the
+        # SAME workbook (ctx.profiler_out). openpyxl load→save isn't atomic and an
+        # xlsx is a zip, so concurrent writers corrupt the file (BadZipFile) and,
+        # on Windows, fail outright on the file lock. Serialise the append.
+        with _PROFILER_WRITE_LOCK:
+            append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
         return True, f"profiler ok ({len(result.values)} fields){remote_note}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
