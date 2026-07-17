@@ -761,8 +761,19 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
         token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
     elif entry.platform == "bitbucket":
         token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
-        # app password -> real username; access token -> x-token-auth sentinel
-        user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip() or "x-token-auth"
+        bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip()
+        # Git-over-HTTPS username differs from the REST API username:
+        #   • Atlassian API token (ATATT…): git needs the STATIC username
+        #     "x-bitbucket-api-token-auth". The email works for REST but git
+        #     rejects it ("you may not have access to this repository").
+        #   • App password: the real Bitbucket username.
+        #   • Workspace/repo access token: the "x-token-auth" sentinel.
+        if token.startswith("ATATT"):
+            user = "x-bitbucket-api-token-auth"
+        elif bb_user:
+            user = bb_user
+        else:
+            user = "x-token-auth"
     if token:
         auth = base64.b64encode(f"{user}:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
