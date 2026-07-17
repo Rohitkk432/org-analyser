@@ -783,8 +783,19 @@ def fetch_merged_gitlab_mrs(
 
 def _bitbucket_auth_header(token: str, username: str = "") -> str:
     import base64
-    user = username.strip() or "x-bitbucket-api-token-auth"
-    return "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+    user = username.strip()
+    if user:
+        # App password (Bitbucket username) or Atlassian API token (email) → Basic.
+        return "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+    if token.startswith("ATATT"):
+        # The static "x-bitbucket-api-token-auth" user works for git but NOT the
+        # REST API — it returns a misleading "Token is invalid".
+        raise RuntimeError(
+            "Atlassian API token (ATATT…) needs your Atlassian account email. "
+            "Set bitbucket_username to that email in the tokens file."
+        )
+    # Workspace/Repository/Project access token → Bearer.
+    return "Bearer " + token
 
 
 def bitbucket_rest_get(
