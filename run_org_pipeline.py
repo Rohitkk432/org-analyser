@@ -868,6 +868,8 @@ def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         elif not remote_ref and entry.platform == "gitlab":
             remote_ref = ("gitlab", entry.full_name)
 
+        provider = remote = None
+        remote_note = ""
         if remote_ref:
             platform, full_name = remote_ref
             if platform == "github":
@@ -879,24 +881,25 @@ def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
                 parts = full_name.split("/")
                 owner, name = "/".join(parts[:-1]), parts[-1]
                 provider = make_provider("gitlab", token=token, host=ctx.gitlab_host)
-            remote = provider.get_repo(owner, name)
-            result = profile_dataset(
-                str(clone_path),
-                use_github=True,
-                provider=provider,
-                remote=remote,
-                originating_company=entry.org,
-                repo_name=entry.repo_slug,
-            )
-        else:
-            result = profile_dataset(
-                str(clone_path),
-                use_github=True,
-                originating_company=entry.org,
-                repo_name=entry.repo_slug,
-            )
+            try:
+                remote = provider.get_repo(owner, name)
+            except Exception as exc:
+                # Remote metadata (PR/fork stats) is optional. A transient API
+                # failure (e.g. GitHub 503) must NOT wipe out the whole profile —
+                # fall back to analysing the local clone so we still emit a row.
+                provider = remote = None
+                remote_note = f" (remote metadata skipped: {type(exc).__name__}: {exc})"
+
+        result = profile_dataset(
+            str(clone_path),
+            use_github=True,
+            provider=provider,
+            remote=remote,
+            originating_company=entry.org,
+            repo_name=entry.repo_slug,
+        )
         append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
-        return True, f"profiler ok ({len(result.values)} fields)"
+        return True, f"profiler ok ({len(result.values)} fields){remote_note}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
 
