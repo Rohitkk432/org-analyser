@@ -4,10 +4,16 @@ github-data-token=ghp_your_github_token_here
 gitlab_token=glpat_your_gitlab_token_here
 
 # Bitbucket (only if analyzing a Bitbucket workspace/repo).
-# Use EITHER a workspace/repo API token (leave bitbucket_username blank),
-# OR an app password (set bitbucket_username to your Bitbucket username).
-# bitbucket_token=your_bitbucket_token_or_app_password_here
-# bitbucket_username=your_bitbucket_username_here
+# Pick ONE credential type and set bitbucket_username to match:
+#   1. Atlassian API token (starts with ATATT…, from id.atlassian.com)
+#        bitbucket_username = your Atlassian account email  (REQUIRED — the REST
+#        API rejects the token without it: "Token is invalid")
+#   2. App password (from Bitbucket personal settings)
+#        bitbucket_username = your Bitbucket username (not email)
+#   3. Workspace/Repository/Project access token
+#        leave bitbucket_username blank (authenticates via Bearer)
+# bitbucket_token=your_bitbucket_token_here
+# bitbucket_username=your_atlassian_email_or_bitbucket_username_here
 
 # ── LLM provider ──────────────────────────────────────────────────────────────
 # Use EITHER OpenAI directly, OR Azure AI Foundry / Azure OpenAI.

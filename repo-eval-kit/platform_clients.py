@@ -396,12 +396,25 @@ class BitbucketClient(PlatformClient):
         self._configure_auth()
 
     def _configure_auth(self) -> None:
+        # Two Bitbucket Cloud token types, two REST auth schemes:
+        #   • App password / Atlassian API token → HTTP Basic (username:token).
+        #     App password uses your Bitbucket username; API token (ATATT…) uses
+        #     your Atlassian account email. The static "x-bitbucket-api-token-auth"
+        #     username works for git but NOT the REST API — it returns a
+        #     misleading "Token is invalid", so we never use it here.
+        #   • Workspace/Repo/Project access token → Authorization: Bearer.
         if not self.token:
             return
         if self.username:
             self.session.auth = (self.username, self.token)
+        elif self.token.startswith("ATATT"):
+            raise ValueError(
+                "Atlassian API token (ATATT…) needs your Atlassian account email "
+                "for REST auth. Set BITBUCKET_EMAIL (or BITBUCKET_USERNAME) to the "
+                "email you log into Bitbucket with."
+            )
         else:
-            self.session.auth = ("x-bitbucket-api-token-auth", self.token)
+            self.session.headers["Authorization"] = f"Bearer {self.token}"
 
     def fetch_prs(self, cursor: Optional[str] = None, page_size: int = 50, start_date: Optional[datetime] = None) -> dict:
         if cursor and cursor.startswith("http"):
