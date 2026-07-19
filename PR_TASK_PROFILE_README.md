@@ -5,9 +5,11 @@ Classify every **merged** pull request / merge request into task profiles using 
 1. **Rules** — deterministic rulebook (fast, consistent, transparent)
 2. **LLM** — language model judging the same extracted signals (better at nuance)
 
-Supports **GitHub** (GraphQL) and **GitLab** (REST).
+Supports **GitHub** (GraphQL), **GitLab** (REST), and **Bitbucket** (REST 2.0).
 
-Script: [`pr_task_profile_report.py`](./pr_task_profile_report.py)
+Module: [`analysis/pr_task_profile.py`](./analysis/pr_task_profile.py) (run via
+`python3 -m analysis.pr_task_profile ...` after `pip install -e .`, or through
+the unified `org-analyser` CLI, which calls this module directly).
 
 ---
 
@@ -41,6 +43,8 @@ Set credentials as environment variables or in a `.env` file (loaded automatical
 ```dotenv
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx          # only for GitLab targets
+BITBUCKET_TOKEN=xxxxxxxxxxxxxxxxxxxx              # only for Bitbucket targets; omit for public repos
+BITBUCKET_USERNAME=your-bitbucket-username        # app passwords / Atlassian API token email only
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -48,7 +52,9 @@ OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 |----------|----------|-------|
 | `GITHUB_TOKEN` | GitHub targets | Read access to target repos. |
 | `GITLAB_TOKEN` | GitLab targets | Read access to target groups/projects. |
-| `OPENAI_API_KEY` | Always | LLM pass is mandatory. |
+| `BITBUCKET_TOKEN` | Bitbucket targets | Optional for public repos (anonymous, lower rate limit). See `profiler/README.md` → Authentication for the token-type-to-username mapping. |
+| `BITBUCKET_USERNAME` | Bitbucket app passwords / Atlassian API tokens | Leave unset for a workspace/repo access token. |
+| `OPENAI_API_KEY` | Always, unless Azure is configured | LLM pass is mandatory; `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY` work instead. |
 
 ---
 
@@ -71,20 +77,33 @@ OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | Whole group (incl. subgroups) | `--gitlab-group my-group` |
 | Single project | `--gitlab-project group/project` |
 
+### Bitbucket targets
+
+| Goal | Command |
+|------|---------|
+| One or more repos | `--bitbucket-repo workspace/repo` (repeatable / comma-separated) |
+
+Bitbucket has no whole-workspace expansion here — pass each repo explicitly
+(the unified `org-analyser --bitbucket-workspace ...` CLI expands a workspace
+for you and calls this module with the resolved repo list).
+
 ### Examples
 
 ```bash
 # GitHub org — all merged PRs, org-level summary + zip
-python3 pr_task_profile_report.py --org data-tech
+python3 -m analysis.pr_task_profile --org your-org
 
 # GitHub repo with tuning for large orgs
-python3 pr_task_profile_report.py --org acme-corp --page-size 50 --max-workers 16 --sleep 0.5
+python3 -m analysis.pr_task_profile --org your-org --page-size 50 --max-workers 16 --sleep 0.5
 
 # GitLab group
-python3 pr_task_profile_report.py --gitlab-group my-group --max-workers 16 --sleep 0.3
+python3 -m analysis.pr_task_profile --gitlab-group my-group --max-workers 16 --sleep 0.3
+
+# Bitbucket repos
+python3 -m analysis.pr_task_profile --bitbucket-repo my-workspace/frontend --bitbucket-repo my-workspace/backend
 
 # Mixed targets in one run
-python3 pr_task_profile_report.py --org acme-corp --repo acme-corp/mobile-app
+python3 -m analysis.pr_task_profile --org your-org --repo your-org/mobile-app
 ```
 
 ---
@@ -98,6 +117,7 @@ python3 pr_task_profile_report.py --org acme-corp --repo acme-corp/mobile-app
 | `--user` | — | GitHub user login. Repeatable / comma-separated. |
 | `--gitlab-group` | — | GitLab group path. Repeatable / comma-separated. |
 | `--gitlab-project` | — | GitLab project path. Repeatable / comma-separated. |
+| `--bitbucket-repo` | — | Bitbucket `workspace/repo` path. Repeatable / comma-separated. |
 | `--include-archived` | off | Include archived repos/projects. |
 | `--no-forks` / `--include-forks` | forks excluded | Fork handling for GitHub expansion. |
 | `--output-dir` | `outputs` | Base directory for run output. |
@@ -155,8 +175,8 @@ Each run creates a timestamped directory: `outputs/scan_<YYYYMMDD_HHMMSS>/`
 
 ## How it works
 
-1. **Resolve targets** → de-duplicated list of GitHub repos or GitLab projects.
-2. **Fetch merged PRs/MRs** via GitHub GraphQL or GitLab REST (with checkpoint/resume support).
+1. **Resolve targets** → de-duplicated list of GitHub repos, GitLab projects, or Bitbucket repos.
+2. **Fetch merged PRs/MRs** via GitHub GraphQL, GitLab REST, or Bitbucket REST 2.0 (with checkpoint/resume support).
 3. **Extract signals** — file count, tests, linked issues, discussion, reviewers, bots.
 4. **Classify twice** — rules and LLM on the same signals.
 5. **Write outputs** — org-level repo summary (CSV + JSON), per-PR detail, log, and zip archive.
@@ -169,7 +189,8 @@ Checkpoints are stored under `<output-dir>/checkpoints/` so interrupted runs can
 
 | Symptom | Fix |
 |---------|-----|
-| Token not set | Export `GITHUB_TOKEN`, `GITLAB_TOKEN`, or `OPENAI_API_KEY`. |
+| Token not set | Export `GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`, or `OPENAI_API_KEY`. |
+| Bitbucket "Token is invalid" | Atlassian API tokens (`ATATT…`) need `BITBUCKET_USERNAME` set to your Atlassian account **email**, not username. |
 | GraphQL 502/503/504 | Lower `--page-size`, raise `--sleep`; script retries automatically. |
 | Rate limits | Lower `--max-workers`, raise `--sleep`. |
 | Slow GitLab scan | 2 API calls per MR; expect hours for large groups. |
