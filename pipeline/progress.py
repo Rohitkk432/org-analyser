@@ -17,12 +17,27 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from contextlib import contextmanager
 from typing import Iterator
 
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+
+# One row per link in cli.py's REPO_PHASE_CHAIN. Kept here (rather than
+# imported from cli.py) to avoid a cli.py <-> pipeline.progress import
+# cycle; cli.py's process_repo is the source of truth for what actually
+# runs and must keep calling update_phase with exactly these names.
+REPO_PHASES = ("clone", "redact", "codebase-profiler", "repo-analyzer", "eval-kit", "repo-quality-score")
 
 
 def should_use_rich(quiet: bool) -> bool:
@@ -55,26 +70,44 @@ def rich_console_handler(logger: logging.Logger, console: Console) -> Iterator[N
 
 
 class RunProgress:
-    """One spinner row per org-lane (merged-pr-counts, pr-task-profile) plus
-    one bar for the repo pool, all on the Console shared with logging (see
-    module docstring for why that sharing matters)."""
+    """Spinner rows for the org-lanes (merged-pr-counts, pr-task-profile),
+    plus one bar per repo-phase (clone/redact/codebase-profiler/...) and an
+    overall repo bar, all sharing the Console logging is bound to (see
+    module docstring for why that sharing matters).
 
-    def __init__(self, console: Console, total_repos: int) -> None:
+    Rich's `Progress.add_task`/`.update` take their own internal lock, so
+    calling them from many repo-pool worker threads at once is fine; the
+    plain dict this class uses to derive running/done/failed *counts* is
+    not thread-safe on its own, hence `_lock`.
+    """
+
+    def __init__(self, console: Console, total_repos: int, phase_names: tuple[str, ...] = REPO_PHASES) -> None:
         self.console = console
         self.total_repos = total_repos
         self.progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold]{task.description}[/bold]"),
-            BarColumn(bar_width=30),
+            BarColumn(bar_width=24),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
             TextColumn("{task.fields[status]}"),
             TimeElapsedColumn(),
             console=console,
             transient=False,
         )
         self.repo_task = self.progress.add_task(
-            "repos", total=total_repos, status=f"0/{total_repos}"
+            "repos", total=total_repos, status="ok=0 partial=0 failed=0"
         )
         self._org_tasks: dict[str, int] = {}
+
+        self._lock = threading.Lock()
+        self._phase_counts: dict[str, dict[str, int]] = {
+            name: {"running": 0, "done": 0, "failed": 0} for name in phase_names
+        }
+        self._phase_tasks: dict[str, int] = {
+            name: self.progress.add_task(name, total=total_repos, status="pending")
+            for name in phase_names
+        }
 
     def __enter__(self) -> "RunProgress":
         self.progress.start()
@@ -96,5 +129,28 @@ class RunProgress:
         self.progress.update(
             self.repo_task,
             completed=done,
-            status=f"{done}/{self.total_repos} ok={ok} partial={partial} failed={failed}",
+            status=f"ok={ok} partial={partial} failed={failed}",
         )
+
+    def update_phase(self, phase: str, event: str) -> None:
+        """event: one of "start" (phase kicked off for a repo), "ok"/"failed"
+        (phase finished for a repo), "skip" (resume: already ok, never ran
+        this generation -- counts straight as done, no running increment)."""
+        counts = self._phase_counts.get(phase)
+        task_id = self._phase_tasks.get(phase)
+        if counts is None or task_id is None:
+            return
+        with self._lock:
+            if event == "start":
+                counts["running"] += 1
+            elif event == "ok":
+                counts["running"] = max(0, counts["running"] - 1)
+                counts["done"] += 1
+            elif event == "failed":
+                counts["running"] = max(0, counts["running"] - 1)
+                counts["failed"] += 1
+            elif event == "skip":
+                counts["done"] += 1
+            running, done, failed = counts["running"], counts["done"], counts["failed"]
+        status = "pending" if not (running or done or failed) else f"running={running} failed={failed}"
+        self.progress.update(task_id, completed=done + failed, status=status)

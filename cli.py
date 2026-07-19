@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
@@ -198,6 +199,32 @@ AZURE_TOKEN_NAMES = (
 )
 # Only needed when --pr-rubrics-provider is gemini; promoted the same way.
 GEMINI_TOKEN_NAME = "gemini_key"
+
+# codebase-profiler and repo-analyzer run ast.parse() on cloned repos' own
+# Python source (arbitrary third-party code we don't control) to check
+# syntax validity / collect metrics. Real-world source often has non-raw
+# string literals with backslash sequences the parser flags -- noise about
+# the target repo, not about org-analyser. ast.parse's default filename is
+# the literal string "<unknown>", which lets this hook single those out
+# without also swallowing a genuine warning from org-analyser's own code
+# (which would carry a real file path). Installed once at import time --
+# a plain module-global counter/lock, safe to hit from every repo-pool
+# worker thread, unlike toggling warnings.catch_warnings() per call.
+_target_repo_warning_count = 0
+_target_repo_warning_lock = threading.Lock()
+_default_showwarning = warnings.showwarning
+
+
+def _quiet_target_repo_showwarning(message, category, filename, lineno, file=None, line=None):
+    if category is SyntaxWarning and filename == "<unknown>":
+        global _target_repo_warning_count
+        with _target_repo_warning_lock:
+            _target_repo_warning_count += 1
+        return
+    _default_showwarning(message, category, filename, lineno, file, line)
+
+
+warnings.showwarning = _quiet_target_repo_showwarning
 
 
 @dataclass
@@ -688,6 +715,14 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
     log.info("Phase 1: merged PR counts (always refetch)")
     ctx.merged_pr_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-repo progress ("[10/13] latest=... count=0") is verbose and would
+    # otherwise print raw to stdout, fighting the rich UI's live rendering
+    # and cluttering plain-log runs alike. Captured here and written to the
+    # phase log file instead -- same treatment pr-task-profile's subprocess
+    # output already gets.
+    progress_lines: list[str] = []
+    progress_cb = progress_lines.append
+
     if ctx.platform == "github":
         summary = export_github_org(
             ctx.tokens[ctx.github_token_name],
@@ -695,6 +730,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             ctx.github_token_name,
             ctx.merged_pr_dir,
             ctx.github_host,
+            progress_cb,
         )
     elif ctx.platform == "github-repo":
         summary = export_github_repos(
@@ -703,6 +739,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             ctx.github_token_name,
             ctx.merged_pr_dir,
             ctx.github_host,
+            progress_cb,
         )
     elif ctx.platform == "bitbucket":
         summary = export_bitbucket_workspace(
@@ -711,6 +748,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             BITBUCKET_TOKEN_NAME,
             ctx.merged_pr_dir,
             ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""),
+            progress_cb,
         )
     elif ctx.platform == "bitbucket-repo":
         summary = export_bitbucket_repos(
@@ -719,6 +757,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             BITBUCKET_TOKEN_NAME,
             ctx.merged_pr_dir,
             ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""),
+            progress_cb,
         )
     elif ctx.platform == "gitlab-project":
         summary = export_gitlab_projects(
@@ -727,6 +766,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             GITLAB_TOKEN_NAME,
             ctx.merged_pr_dir,
             ctx.gitlab_host,
+            progress_cb,
         )
     else:
         summary = export_gitlab_group(
@@ -735,7 +775,11 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             GITLAB_TOKEN_NAME,
             ctx.merged_pr_dir,
             ctx.gitlab_host,
+            progress_cb,
         )
+
+    if progress_lines:
+        log.phase_log(ctx.logs_dir / "merged-pr-counts.log", "\n".join(progress_lines))
 
     summary_path = ctx.merged_pr_dir / "summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as fh:
@@ -1319,7 +1363,12 @@ def _invalidate_downstream(state: StateStore, run_id: int, repo: str, from_phase
         state.reset_phase(run_id, phase, repo, force=True)
 
 
-def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict[str, Any]:
+def process_repo(
+    entry: RepoEntry,
+    ctx: RunContext,
+    log: PipelineLogger,
+    on_phase: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     repo_log = ctx.repo_log_dir(entry)
     status: dict[str, Any] = {
         "full_name": entry.full_name,
@@ -1332,6 +1381,13 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
         ctx.tokens.get(GITLAB_TOKEN_NAME, ""),
         ctx.tokens.get(BITBUCKET_TOKEN_NAME, ""),
     ]
+
+    def emit_phase(phase: str, event: str) -> None:
+        # event: "start" | "ok" | "failed" | "skip" (resume: already ok).
+        # Feeds the rich progress UI's per-phase rows; a no-op under --quiet
+        # or non-TTY output (on_phase is None there).
+        if on_phase is not None:
+            on_phase(phase, event)
 
     def phase_log_path(phase: str) -> str:
         return str(repo_log / f"{phase}.log")
@@ -1357,7 +1413,9 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
                 "attempts": 0,
                 "detail": "skipped (resume: already ok)",
             }
+            emit_phase(phase, "skip")
             return True
+        emit_phase(phase, "start")
         attempt_no = ctx.state.start_repo_phase(
             ctx.run_id, entry.full_name, entry.platform, phase, ctx.generation
         )
@@ -1378,6 +1436,7 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
             duration_ms=duration_ms,
             attempt=attempt_no,
         )
+        emit_phase(phase, "ok" if ok else "failed")
         if not ok:
             log.info(f"  {entry.full_name}: {phase} failed after {attempts} attempt(s)")
         return ok
@@ -1395,7 +1454,9 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
             record(
                 "clone", True, f"reusing existing local copy from a previous run: {clone_path}", 1
             )
+            emit_phase("clone", "skip")
         else:
+            emit_phase("clone", "start")
             attempt_no = ctx.state.start_repo_phase(
                 ctx.run_id, entry.full_name, entry.platform, "clone", ctx.generation
             )
@@ -1415,6 +1476,7 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
                 duration_ms=duration_ms,
                 attempt=attempt_no,
             )
+            emit_phase("clone", "ok" if ok else "failed")
             if not ok:
                 status["overall"] = "failed"
                 return status
@@ -1426,7 +1488,9 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
         if prior_clone_ok and _clone_is_valid(target_path):
             clone_path = target_path
             record("clone", True, f"reusing existing clone from a previous run: {clone_path}", 1)
+            emit_phase("clone", "skip")
         else:
+            emit_phase("clone", "start")
             attempt_no = ctx.state.start_repo_phase(
                 ctx.run_id, entry.full_name, entry.platform, "clone", ctx.generation
             )
@@ -1453,6 +1517,7 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
                 duration_ms=duration_ms,
                 attempt=attempt_no,
             )
+            emit_phase("clone", "ok" if ok else "failed")
             if not ok:
                 status["overall"] = "failed"
                 return status
@@ -2110,7 +2175,10 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                 lambda: run_pr_task_profile(ctx, log, entries),
             )
 
-            repo_futures = {repo_pool.submit(process_repo, e, ctx, log): e for e in entries}
+            on_phase = progress_ui.update_phase if progress_ui else None
+            repo_futures = {
+                repo_pool.submit(process_repo, e, ctx, log, on_phase): e for e in entries
+            }
             for i, fut in enumerate(as_completed(repo_futures), 1):
                 entry = repo_futures[fut]
                 try:
@@ -2205,6 +2273,11 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
             f"{ctx.manifest['summary']['partial']} partial, "
             f"{ctx.manifest['summary']['failed']} failed"
         )
+        if _target_repo_warning_count:
+            log.info(
+                f"({_target_repo_warning_count} syntax warnings from target-repo source "
+                "suppressed -- not org-analyser code, informational only)"
+            )
         return 0 if fully_ok else 1
     except KeyboardInterrupt:
         log.error(

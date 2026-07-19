@@ -2934,6 +2934,7 @@ class RepoEvaluator:
         pr_number: Optional[int] = None,
         skip_pr_rubrics: bool = False,
         pr_rubrics_provider: str = "openai",
+        rubrics_batch_work_dir: Optional[Path] = None,
     ):
         self.repo_path = repo_path
         self.owner = owner
@@ -2952,6 +2953,7 @@ class RepoEvaluator:
         self.language_config = load_language_config()
         self.skip_pr_rubrics = skip_pr_rubrics
         self.pr_rubrics_provider = pr_rubrics_provider
+        self.rubrics_batch_work_dir = rubrics_batch_work_dir
 
     def evaluate(self) -> AnalysisReport:
         if not self.platform_client:
@@ -3275,7 +3277,11 @@ class RepoEvaluator:
             pr_analysis.pr_rubrics = []
             return pr_analysis
         try:
-            from eval.quality_evaluator import QualityEvaluator, split_patch_by_test_files
+            from eval.quality_evaluator import (
+                QualityEvaluator,
+                RubricCandidate,
+                split_patch_by_test_files,
+            )
         except ImportError:
             logger.warning("quality_evaluator module not found; skipping PR rubrics")
             pr_analysis.pr_rubrics = []
@@ -3293,6 +3299,15 @@ class RepoEvaluator:
         qe = QualityEvaluator(llm_provider=self.pr_rubrics_provider)
         results: List[dict] = []
 
+        # Collect every candidate's prompt inputs first (patch fetch and
+        # splitting are local git operations), then hand the whole set to
+        # evaluate_candidates so the LLM calls go through llm.batch's
+        # run_batch_or_sync -- a thread pool of live calls below its
+        # threshold, the Batch API above it -- instead of the old
+        # one-live-call-per-PR sequential loop.
+        candidates: List[RubricCandidate] = []
+        cand_entries: List[dict] = []
+
         for pr in pr_analysis.accepted_prs:
             pr_number = pr.get("number")
             if self.pr_number is not None and pr_number != self.pr_number:
@@ -3301,11 +3316,11 @@ class RepoEvaluator:
                 "number": pr_number,
                 "url": pr.get("url", ""),
             }
+            results.append(entry)
             base_sha = pr.get("baseRefOid", "") or ""
             head_sha = pr.get("headRefOid", "") or ""
             if not base_sha or not head_sha:
                 entry["error"] = "missing base or head SHA"
-                results.append(entry)
                 continue
 
             full_patch = pr_analyzer._get_patch_from_git(
@@ -3313,7 +3328,6 @@ class RepoEvaluator:
             )
             if not full_patch:
                 entry["error"] = "could not retrieve patch"
-                results.append(entry)
                 continue
 
             pr_files_nodes = pr.get("files", {}).get("nodes", [])
@@ -3327,28 +3341,41 @@ class RepoEvaluator:
             problem_statement = _problem_statement_for_pr(pr)
             commit_message = (pr.get("title") or "").strip()
 
-            try:
-                _passed, scores = qe.evaluate_candidate(
-                    src_diff,
-                    test_diff,
+            candidates.append(
+                RubricCandidate(
+                    src_diff=src_diff,
+                    test_diff=test_diff,
                     problem_statement=problem_statement or None,
                     hints="",
                     commit_message=commit_message,
                     files_changed=files_changed,
+                    label=f"PR #{pr_number}",
+                )
+            )
+            cand_entries.append(entry)
+
+        if candidates:
+            try:
+                scored = qe.evaluate_candidates(
+                    candidates,
+                    batch_work_dir=self.rubrics_batch_work_dir,
+                    tag=f"{self.owner}_{self.repo_name}",
                 )
             except Exception as e:
-                logger.warning("PR rubrics failed for #%s: %s", pr_number, e)
-                entry["error"] = str(e)
-                results.append(entry)
-                continue
-
-            if scores is None:
-                entry["error"] = qe.last_rejection_reason or "evaluation_failed"
-                results.append(entry)
-                continue
-
-            entry["rubrics"] = scores.to_trimmed_rubrics_dict()
-            results.append(entry)
+                logger.warning(
+                    "PR rubrics failed for %s: %s", self.repo_full_name, e
+                )
+                for entry in cand_entries:
+                    entry["error"] = str(e)
+            else:
+                for entry, (_passed, scores, error) in zip(cand_entries, scored):
+                    if scores is None:
+                        logger.warning(
+                            "PR rubrics failed for #%s: %s", entry["number"], error
+                        )
+                        entry["error"] = error or "evaluation_failed"
+                    else:
+                        entry["rubrics"] = scores.to_trimmed_rubrics_dict()
 
         pr_analysis.pr_rubrics = results
         return pr_analysis
@@ -4191,6 +4218,11 @@ def main():
             pr_number=args.pr_number,
             skip_pr_rubrics=args.skip_pr_rubrics,
             pr_rubrics_provider=args.pr_rubrics_provider,
+            rubrics_batch_work_dir=(
+                Path(args.output).parent / "batch_state" / "rubrics" / f"{owner}_{repo_name}"
+                if args.output
+                else None
+            ),
         )
 
         report = evaluator.evaluate()
