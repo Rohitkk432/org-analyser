@@ -157,6 +157,7 @@ from analysis.merged_prs import (  # noqa: E402
     safe_filename,
 )
 from eval.credential_redactor import scrub_secrets  # noqa: E402
+from platforms.bitbucket import resolve_bitbucket_git_auth  # noqa: E402
 
 GITHUB_TOKEN_NAME = "github-data-token"
 GITLAB_TOKEN_NAME = "gitlab_token"
@@ -173,6 +174,8 @@ AZURE_TOKEN_NAMES = (
     "AZURE_OPENAI_DEPLOYMENT",
     "OPENAI_API_VERSION",
 )
+# Only needed when --pr-rubrics-provider is gemini; promoted the same way.
+GEMINI_TOKEN_NAME = "gemini_key"
 
 
 @dataclass
@@ -219,6 +222,7 @@ class RunContext:
     retries: int
     clone_depth: int | None
     skip_f2p: bool
+    pr_rubrics_provider: str
     local_only: bool
     github_host: str
     gitlab_host: str
@@ -503,6 +507,17 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
             "AZURE_OPENAI_API_KEY"
         )
 
+    # Only needed for the gemini PR-rubrics path; not a hard requirement
+    # otherwise, so this is a warning, not an error.
+    gemini_key = ctx.tokens.get(GEMINI_TOKEN_NAME, "").strip()
+    if gemini_key and not os.environ.get("GEMINI_API_KEY", "").strip():
+        os.environ["GEMINI_API_KEY"] = gemini_key
+    if ctx.pr_rubrics_provider == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
+        log.error(
+            f"--pr-rubrics-provider=gemini but no GEMINI_API_KEY is set "
+            f"(or {GEMINI_TOKEN_NAME}= in the tokens file)"
+        )
+
     if ctx.platform in ("github", "github-repo"):
         if not ctx.tokens.get(ctx.github_token_name):
             errors.append(f"Missing {ctx.github_token_name} in tokens file")
@@ -742,18 +757,10 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
     elif entry.platform == "bitbucket":
         token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
         bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip()
-        # Git-over-HTTPS username differs from the REST API username:
-        #   • Atlassian API token (ATATT…): git needs the STATIC username
-        #     "x-bitbucket-api-token-auth". The email works for REST but git
-        #     rejects it ("you may not have access to this repository").
-        #   • App password: the real Bitbucket username.
-        #   • Workspace/repo access token: the "x-token-auth" sentinel.
-        if token.startswith("ATATT"):
-            user = "x-bitbucket-api-token-auth"
-        elif bb_user:
-            user = bb_user
-        else:
-            user = "x-token-auth"
+        # Git-over-HTTPS username differs from the REST API username -- see
+        # resolve_bitbucket_git_auth's docstring (an Atlassian API token needs
+        # the static "x-bitbucket-api-token-auth" sentinel here, unlike REST).
+        user = resolve_bitbucket_git_auth(token, bb_user)
     if token:
         auth = base64.b64encode(f"{user}:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
@@ -979,6 +986,7 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         args.extend(["--repo-path", str(clone_path)])
     if ctx.skip_f2p:
         args.append("--skip-f2p")
+    args.extend(["--pr-rubrics-provider", ctx.pr_rubrics_provider])
 
     extra_env: dict[str, str] = {}
     if token:
@@ -1413,6 +1421,7 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         retries=args.retries,
         clone_depth=args.clone_depth if args.clone_depth > 0 else None,
         skip_f2p=args.skip_f2p,
+        pr_rubrics_provider=args.pr_rubrics_provider,
         local_only=local_only,
         github_host=args.github_host,
         gitlab_host=args.gitlab_host,
@@ -1546,6 +1555,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip F2P/P2P test verification in eval-kit (the slowest phase: it "
         "installs deps and runs the test suite per accepted PR). Recommended "
         "for large repos.",
+    )
+    parser.add_argument(
+        "--pr-rubrics-provider",
+        choices=("openai", "gemini"),
+        default=CONFIG.get("pr_rubrics_provider", "openai"),
+        help="LLM provider for eval-kit's PR-rubrics scoring: openai "
+        "(OPENAI_API_KEY/Azure) or gemini (GEMINI_API_KEY / gemini_key in "
+        "tokens). Default: openai.",
     )
     parser.add_argument(
         "--local-only",

@@ -7,8 +7,10 @@ from typing import List, Optional, Tuple
 
 try:
     from .credential_redactor import redact_diff, redact_secrets, redaction_summary
+    from .llm_safety import safe_gemini, safe_openai
 except ImportError:  # invoked as a top-level script (cwd=eval)
     from credential_redactor import redact_diff, redact_secrets, redaction_summary
+    from llm_safety import safe_gemini, safe_openai
 
 logger = logging.getLogger(__name__)
 
@@ -712,8 +714,6 @@ class QualityEvaluator:
         )
 
     def _call_llm(self, prompt: str) -> Optional[str]:
-        import requests
-
         if not self.api_key:
             logger.error(f"No API key configured for {self.llm_provider}")
             return None
@@ -738,79 +738,30 @@ class QualityEvaluator:
             return None
 
     def _call_gemini(self, prompt: str) -> Optional[str]:
-        import requests
-
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
-        try:
-            response = requests.post(
-                # Key travels in the header only. In the query string it lands
-                # in proxy logs, gateway logs, and shell history.
-                url,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": self.api_key,
-                },
-                json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
-                timeout=120,
-            )
-            response.raise_for_status()
-            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Gemini API failed: {e}")
-            return None
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected Gemini response: {e}")
-            return None
+        # safe_gemini() does its own redaction pass, the REST call (key in the
+        # x-goog-api-key header, never the query string), and response parsing.
+        return safe_gemini(prompt, api_key=self.api_key or None)
 
     def _call_openai(self, prompt: str) -> Optional[str]:
-        import requests
-
-        # Azure AI Foundry when AZURE_OPENAI_ENDPOINT is set, OpenAI otherwise.
-        # Azure addresses the model by deployment in the URL and authenticates
-        # with an `api-key` header instead of a bearer token.
-        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
-        if azure_endpoint:
-            deployment = (
-                os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
-                or self.openai_model
-            )
-            api_version = os.environ.get("OPENAI_API_VERSION", "2024-10-21")
-            url = (
-                f"{azure_endpoint.rstrip('/')}/openai/deployments/{deployment}"
-                f"/chat/completions?api-version={api_version}"
-            )
-            headers = {"Content-Type": "application/json", "api-key": self.api_key}
-        else:
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            }
-
+        # safe_openai() talks to Azure AI Foundry when AZURE_OPENAI_ENDPOINT is
+        # set, OpenAI otherwise -- same guarded client either way, so this no
+        # longer needs its own Azure-vs-OpenAI URL/header branching.
         try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json={
-                    "model": self.openai_model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a code review assistant. Respond only with valid JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0,
-                },
-                timeout=120,
+            client = safe_openai(api_key=self.api_key or None)
+            response = client.chat.completions.create(
+                model=self.openai_model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a code review assistant. Respond only with valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
             )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-        except requests.exceptions.RequestException as e:
+            return response.choices[0].message.content
+        except Exception as e:
             logger.error(f"OpenAI API failed: {e}")
-            return None
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected OpenAI response: {e}")
             return None
 
     def _parse_json_response(self, response: str) -> Optional[dict]:

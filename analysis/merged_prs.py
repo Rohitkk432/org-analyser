@@ -21,89 +21,25 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
+
+from platforms import bitbucket as bitbucket_platform
+from platforms import github as github_platform
+from platforms import gitlab as gitlab_platform
+from platforms.base import ci_headers, request_with_retry
+
 CSV_FIELDS = ["platform", "org", "repo", "merged_count", "error"]
 SUMMARY_FIELDS = ["platform", "org", "repos_total", "merged_total", "token_name", "error"]
-
-
-# ---------------------------------------------------------------------------
-# HTTP + pagination
-# ---------------------------------------------------------------------------
-
-def http_get_json(url: str, headers: dict[str, str]) -> tuple[Any, dict[str, str]]:
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = resp.read().decode("utf-8")
-            hdrs = {k: v for k, v in resp.headers.items()}
-            return (json.loads(body) if body else None), hdrs
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
-
-
-def paginate_github(url: str, token: str) -> list[Any]:
-    items: list[Any] = []
-    page = 1
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "org-analyser-merged-prs",
-    }
-    while True:
-        sep = "&" if "?" in url else "?"
-        page_url = f"{url}{sep}page={page}"
-        data, resp_headers = http_get_json(page_url, headers)
-        if not isinstance(data, list):
-            break
-        items.extend(data)
-        if 'rel="next"' not in resp_headers.get("Link", ""):
-            break
-        page += 1
-    return items
-
-
-def paginate_gitlab(
-    base: str,
-    path: str,
-    token: str,
-    params: dict[str, str] | None = None,
-) -> list[Any]:
-    items: list[Any] = []
-    query = dict(params or {})
-    query.setdefault("per_page", "100")
-    page = 1
-    headers = {"PRIVATE-TOKEN": token, "User-Agent": "org-analyser-merged-prs"}
-
-    while True:
-        query["page"] = str(page)
-        url = f"{base}{path}?{urllib.parse.urlencode(query)}"
-        data, resp_headers = http_get_json(url, headers)
-        if not isinstance(data, list):
-            return data if data is not None else items
-        items.extend(data)
-        per_page = int(query.get("per_page", "100"))
-        next_page = resp_headers.get("X-Next-Page")
-        if next_page:
-            page = int(next_page)
-            continue
-        if len(data) < per_page:
-            break
-        page += 1
-    return items
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -133,42 +69,23 @@ def in_range(dt_str: str | None, since: datetime | None, until: datetime | None)
 # GitHub
 # ---------------------------------------------------------------------------
 
-def github_api(token: str, host: str = "github.com") -> str:
-    return "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
-
-
-def github_headers(token: str) -> dict[str, str]:
-    return {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "org-analyser-merged-prs",
-    }
-
-
 def list_github_repos(token: str, org: str, host: str) -> list[str]:
-    api = github_api(token, host)
-    repos: list[str] = []
-    for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
-        batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
-        if batch:
-            repos = [r["full_name"] for r in batch if not r.get("archived")]
-            break
-    if not repos:
-        raise RuntimeError(f"No GitHub repos found for {org!r}")
-    return repos
+    return github_platform.list_repos(token, org, host)
 
 
 def list_github_orgs(token: str, host: str = "github.com") -> list[str]:
-    api = github_api(token, host)
+    session = requests.Session()
+    session.headers.update(github_platform.github_headers(token))
+    api = github_platform.github_api(host)
     orgs: set[str] = set()
 
-    for org in paginate_github(f"{api}/user/orgs?per_page=100", token):
+    for org in github_platform.paginate(session, f"{api}/user/orgs", params={"per_page": 100}):
         orgs.add(org["login"])
 
-    repos = paginate_github(
-        f"{api}/user/repos?affiliation=owner,collaborator,organization_member&per_page=100",
-        token,
+    repos = github_platform.paginate(
+        session,
+        f"{api}/user/repos",
+        params={"affiliation": "owner,collaborator,organization_member", "per_page": 100},
     )
     for repo in repos:
         owner = repo.get("owner") or {}
@@ -193,17 +110,6 @@ def github_graphql(token: str, host: str = "github.com") -> str:
     return "https://api.github.com/graphql" if host == "github.com" else f"https://{host}/api/graphql"
 
 
-def http_post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> Any:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
-
-
 def count_github_merged(
     token: str,
     repo: str,
@@ -212,16 +118,22 @@ def count_github_merged(
     until: datetime | None,
 ) -> int:
     owner, name = repo.split("/", 1)
+    session = requests.Session()
+    session.headers.update(github_platform.github_headers(token))
 
     if since is None and until is None:
-        data = http_post_json(
+        response = request_with_retry(
+            session,
+            "POST",
             github_graphql(token, host),
-            github_headers(token),
-            {
+            json={
                 "query": _GITHUB_MERGED_COUNT_QUERY,
                 "variables": {"owner": owner, "name": name},
             },
         )
+        if response is None:
+            raise RuntimeError(f"Repository not found: {repo}")
+        data = response.json()
         if data.get("errors"):
             raise RuntimeError(str(data["errors"])[:500])
         repository = (data.get("data") or {}).get("repository")
@@ -229,10 +141,11 @@ def count_github_merged(
             raise RuntimeError(f"Repository not found: {repo}")
         return int(repository["pullRequests"]["totalCount"])
 
-    api = github_api(token, host)
-    pulls = paginate_github(
-        f"{api}/repos/{owner}/{name}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
-        token,
+    api = github_platform.github_api(host)
+    pulls = github_platform.paginate(
+        session,
+        f"{api}/repos/{owner}/{name}/pulls",
+        params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 100},
     )
     return sum(
         1 for pr in pulls if pr.get("merged_at") and in_range(pr["merged_at"], since, until)
@@ -256,39 +169,12 @@ def github_merged_counts(
 # GitLab
 # ---------------------------------------------------------------------------
 
-def gitlab_api(host: str = "gitlab.com") -> str:
-    host = host.rstrip("/")
-    if host.startswith("http://") or host.startswith("https://"):
-        base = host
-    else:
-        base = f"https://{host}"
-    return f"{base}/api/v4"
-
-
 def list_gitlab_projects(token: str, group: str, host: str) -> list[str]:
-    api = gitlab_api(host)
-    encoded = urllib.parse.quote(group, safe="")
-    projects = paginate_gitlab(
-        api,
-        f"/groups/{encoded}/projects",
-        token,
-        {"include_subgroups": "true", "archived": "false"},
-    )
-    if not projects:
-        raise RuntimeError(f"No GitLab projects found for group {group!r}")
-    return [p["path_with_namespace"] for p in projects]
+    return gitlab_platform.list_projects(token, group, host)
 
 
 def list_gitlab_top_level_groups(token: str, host: str = "gitlab.com") -> list[str]:
-    api = gitlab_api(host)
-    groups = paginate_gitlab(api, "/groups", token, {"min_access_level": "10"})
-    paths = sorted({g["full_path"] for g in groups if g.get("full_path")})
-    top_level: list[str] = []
-    for path in paths:
-        if any(path.startswith(parent + "/") for parent in top_level):
-            continue
-        top_level.append(path)
-    return top_level
+    return gitlab_platform.list_top_level_groups(token, host)
 
 
 def count_gitlab_merged(
@@ -298,23 +184,27 @@ def count_gitlab_merged(
     since: datetime | None,
     until: datetime | None,
 ) -> int:
-    api = gitlab_api(host)
+    api = gitlab_platform.gitlab_api(host)
     encoded = urllib.parse.quote(project, safe="")
-    params: dict[str, str] = {"state": "merged", "per_page": "100"}
-
+    params: dict[str, str] = {"state": "merged"}
     if since:
         params["updated_after"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     if until:
         params["updated_before"] = until.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    probe_params = {**params, "per_page": "1"}
-    url = f"{api}/projects/{encoded}/merge_requests?{urllib.parse.urlencode(probe_params)}"
-    _, headers = http_get_json(url, {"PRIVATE-TOKEN": token, "User-Agent": "org-analyser-merged-prs"})
-    total = headers.get("X-Total")
-    if total is not None:
-        return int(total)
+    session = requests.Session()
+    session.headers.update(gitlab_platform.gitlab_headers(token))
+    url = f"{api}/projects/{encoded}/merge_requests"
 
-    mrs = paginate_gitlab(api, f"/projects/{encoded}/merge_requests", token, params)
+    # Probe with per_page=1 first -- GitLab returns the true total in
+    # X-Total, cheaper than paginating through every MR just to count them.
+    probe = request_with_retry(session, "GET", url, params={**params, "per_page": 1})
+    if probe is not None:
+        total = ci_headers(probe.headers).get("X-Total")
+        if total is not None:
+            return int(total)
+
+    mrs = gitlab_platform.paginate(session, url, params=params)
     return len(mrs)
 
 
@@ -335,50 +225,8 @@ def gitlab_merged_counts(
 # Bitbucket
 # ---------------------------------------------------------------------------
 
-def bitbucket_headers(token: str, username: str = "") -> dict[str, str]:
-    headers = {"Accept": "application/json", "User-Agent": "org-analyser-merged-prs"}
-    if not token:
-        return headers  # anonymous: fine for public repos (lower rate limit)
-    user = username.strip()
-    if user:
-        # App password (Bitbucket username) or Atlassian API token (email) → Basic.
-        creds = base64.b64encode(f"{user}:{token}".encode()).decode()
-        headers["Authorization"] = f"Basic {creds}"
-    elif token.startswith("ATATT"):
-        # The static "x-bitbucket-api-token-auth" user works for git but NOT the
-        # REST API — it returns a misleading "Token is invalid" / empty results.
-        raise RuntimeError(
-            "Atlassian API token (ATATT…) needs your Atlassian account email. "
-            "Set bitbucket_username to that email in the tokens file."
-        )
-    else:
-        # Workspace/Repository/Project access token → Bearer.
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def paginate_bitbucket(url: str, token: str, username: str = "") -> list[Any]:
-    """Follow Bitbucket's `next` cursor links, collecting every `values` item."""
-    items: list[Any] = []
-    headers = bitbucket_headers(token, username)
-    while url:
-        data, _ = http_get_json(url, headers)
-        if not isinstance(data, dict):
-            break
-        items.extend(data.get("values", []))
-        url = data.get("next", "")
-    return items
-
-
 def list_bitbucket_repos(token: str, workspace: str, username: str = "") -> list[str]:
-    repos = paginate_bitbucket(
-        f"https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=100",
-        token, username,
-    )
-    names = [r["full_name"] for r in repos if r.get("full_name")]
-    if not names:
-        raise RuntimeError(f"No Bitbucket repos found for {workspace!r}")
-    return names
+    return bitbucket_platform.list_repos(token, workspace, username)
 
 
 def count_bitbucket_merged(
@@ -389,16 +237,21 @@ def count_bitbucket_merged(
     until: datetime | None,
 ) -> int:
     workspace, name = repo.split("/", 1)
+    session = requests.Session()
+    session.headers.update(bitbucket_platform.bitbucket_headers(token, username))
     base = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{name}/pullrequests?state=MERGED"
-    headers = bitbucket_headers(token, username)
+
     if since is None and until is None:
         # Bitbucket returns the total in `size` on the first page.
-        data, _ = http_get_json(f"{base}&pagelen=1", headers)
-        if isinstance(data, dict) and "size" in data:
-            return int(data["size"])
+        response = request_with_retry(session, "GET", f"{base}&pagelen=1")
+        if response is not None:
+            data = response.json()
+            if isinstance(data, dict) and "size" in data:
+                return int(data["size"])
         # Fallback: full pagination if `size` is absent.
-        return len(paginate_bitbucket(f"{base}&pagelen=50", token, username))
-    prs = paginate_bitbucket(f"{base}&pagelen=50", token, username)
+        return len(bitbucket_platform.paginate(session, f"{base}&pagelen=50"))
+
+    prs = bitbucket_platform.paginate(session, f"{base}&pagelen=50")
     return sum(
         1 for pr in prs if in_range(pr.get("updated_on"), since, until)
     )
@@ -543,11 +396,14 @@ def parse_tokens_file(path: Path) -> dict[str, str]:
 
 
 def list_github_users(token: str, host: str = "github.com") -> list[str]:
-    api = github_api(token, host)
+    session = requests.Session()
+    session.headers.update(github_platform.github_headers(token))
+    api = github_platform.github_api(host)
     users: set[str] = set()
-    repos = paginate_github(
-        f"{api}/user/repos?affiliation=owner,collaborator,organization_member&per_page=100",
-        token,
+    repos = github_platform.paginate(
+        session,
+        f"{api}/user/repos",
+        params={"affiliation": "owner,collaborator,organization_member", "per_page": 100},
     )
     for repo in repos:
         owner = repo.get("owner") or {}

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke tests for Bitbucket support in run_all_repos.py and platform_clients.py."""
+"""Smoke tests for Bitbucket support in run_all_repos.py.
+
+See platforms/test_bitbucket.py for platforms.bitbucket.BitbucketClient's own
+auth tests.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,6 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from eval.platform_clients import BitbucketClient
 from eval.run_all_repos import (
     BitbucketAPI,
     _bitbucket_to_repo_info,
@@ -112,23 +115,6 @@ class TestBitbucketAuth(unittest.TestCase):
             user = api.authenticate()
         self.assertEqual(user["username"], "alice")
         self.assertTrue(api._auth_mode.startswith("basic:"))
-
-
-class TestBitbucketClientAuth(unittest.TestCase):
-    def test_access_token_uses_bearer(self):
-        # No username + non-ATATT token → workspace/repo access token → Bearer.
-        client = BitbucketClient("owner", "repo", token="secret")
-        self.assertIsNone(client.session.auth)
-        self.assertEqual(client.session.headers["Authorization"], "Bearer secret")
-
-    def test_api_token_without_email_raises(self):
-        # ATATT API token needs the Atlassian email; static user fails on REST.
-        with self.assertRaises(ValueError):
-            BitbucketClient("owner", "repo", token="ATATTsecret")
-
-    def test_uses_basic_auth_when_username_provided(self):
-        client = BitbucketClient("owner", "repo", token="secret", username="bob")
-        self.assertEqual(client.session.auth, ("bob", "secret"))
 
 
 class TestLivePublicApi(unittest.TestCase):

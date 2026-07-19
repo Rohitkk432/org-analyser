@@ -121,6 +121,9 @@ from urllib.parse import quote
 try:
     import requests
     from requests.adapters import HTTPAdapter
+
+    from platforms.base import ci_headers, request_with_retry
+    from platforms.errors import PlatformAuthError
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False   # local mode also works without requests
@@ -780,64 +783,6 @@ def analyze_test_content(content: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HTTP base client (used by both GitLab and GitHub)
-# ---------------------------------------------------------------------------
-
-def _retry_after_seconds(r, default=30):
-    """Parse Retry-After safely (it may be seconds OR an HTTP date)."""
-    v = r.headers.get("Retry-After", "")
-    try:
-        return max(1, int(v))
-    except (TypeError, ValueError):
-        return default
-
-
-class HttpBase:
-    def __init__(self, api_base, headers, workers=8):
-        if not HAS_REQUESTS:
-            raise SystemExit("ERROR: install this first ->  pip install requests")
-        self.api = api_base.rstrip("/")
-        self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=workers * 2,
-                              pool_maxsize=workers * 2, max_retries=2)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-        self.session.headers.update(headers)
-
-    def _rate_limit_wait(self, r):
-        """How long to wait on a 429/403 rate limit. None = not a rate limit."""
-        raise NotImplementedError
-
-    def get(self, path, params=None):
-        url = path if path.startswith("http") else self.api + path
-        for attempt in range(6):
-            try:
-                r = self.session.get(url, params=params, timeout=60)
-            except requests.RequestException as e:
-                # transient network error — back off and retry instead of
-                # killing the whole analysis run
-                if attempt == 5:
-                    print(f"  [warn] network error, giving up on {url}: {e}")
-                    return None
-                time.sleep(min(2 ** attempt, 30))
-                continue
-            wait = self._rate_limit_wait(r)
-            if wait is not None:
-                print(f"  [rate limit] {wait}s wait...")
-                time.sleep(wait)
-                continue
-            if r.status_code in (401, 403):
-                raise SystemExit(
-                    "ERROR: Access denied (401/403). Check the token — "
-                    "the scope must be correct, or the repo is private.")
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            return r
-        return None
-
-
-# ---------------------------------------------------------------------------
 # GitLab provider
 # ---------------------------------------------------------------------------
 
@@ -847,20 +792,38 @@ def enc(project_path):
     return s if s.isdigit() else quote(s, safe="")
 
 
-class GitLabProvider(HttpBase):
+class GitLabProvider:
     kind = "gitlab"
     mr_word = "MRs"
 
     def __init__(self, base_url="https://gitlab.com", token=None, workers=8):
+        if not HAS_REQUESTS:
+            raise SystemExit("ERROR: install this first ->  pip install requests")
+        self.api = base_url.rstrip("/") + "/api/v4"
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=workers * 2,
+                              pool_maxsize=workers * 2, max_retries=2)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         headers = {"User-Agent": "codebase-analyzer"}
         if token:
             headers["PRIVATE-TOKEN"] = token
-        super().__init__(base_url.rstrip("/") + "/api/v4", headers, workers)
+        self.session.headers.update(headers)
 
-    def _rate_limit_wait(self, r):
-        if r.status_code == 429:
-            return _retry_after_seconds(r, default=30)
-        return None
+    def get(self, path, params=None):
+        """Single GET with the shared retry/backoff/rate-limit policy.
+
+        Bad auth (401/403 that isn't a rate limit) raises a catchable
+        `PlatformAuthError` instead of the old `SystemExit` -- one repo's bad
+        token now just fails that repo (see the per-project loop in main()),
+        instead of killing the whole batch run.
+        """
+        url = path if path.startswith("http") else self.api + path
+        response = request_with_retry(self.session, "GET", url, params=params)
+        if response is None:
+            return None
+        response.raise_for_status()
+        return response
 
     def paginate(self, path, params=None, limit=None):
         params = dict(params or {})
@@ -870,7 +833,7 @@ class GitLabProvider(HttpBase):
         while True:
             try:
                 r = self.get(path, params=params)
-            except SystemExit:
+            except PlatformAuthError:
                 raise
             except Exception as e:
                 print(f"  [warn] pagination stopped early: {e}")
@@ -888,7 +851,9 @@ class GitLabProvider(HttpBase):
                 print(f"    ...{len(results)} items fetched")
             if limit and len(results) >= limit:
                 return results[:limit]
-            nxt = r.headers.get("X-Next-Page", "")
+            # X-Next-Page, read case-insensitively -- HTTP/2 can lowercase
+            # it, which silently capped this at the first 100 results.
+            nxt = ci_headers(r.headers).get("X-Next-Page")
             if not nxt:
                 break
             params["page"] = nxt
@@ -1053,45 +1018,50 @@ class GitLabProvider(HttpBase):
 # GitHub provider
 # ---------------------------------------------------------------------------
 
-class GitHubProvider(HttpBase):
+class GitHubProvider:
     kind = "github"
     mr_word = "PRs"
 
     def __init__(self, base_url="https://api.github.com", token=None, workers=8):
+        if not HAS_REQUESTS:
+            raise SystemExit("ERROR: install this first ->  pip install requests")
+        self.api = base_url.rstrip("/")
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=workers * 2,
+                              pool_maxsize=workers * 2, max_retries=2)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         headers = {"User-Agent": "codebase-analyzer",
                    "Accept": "application/vnd.github+json",
                    "X-GitHub-Api-Version": "2022-11-28"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        super().__init__(base_url, headers, workers)
+        self.session.headers.update(headers)
 
-    def _rate_limit_wait(self, r):
-        if r.status_code in (403, 429):
-            if r.headers.get("Retry-After"):
-                return _retry_after_seconds(r, default=60)
-            if r.headers.get("X-RateLimit-Remaining") == "0":
-                try:
-                    reset = int(r.headers.get("X-RateLimit-Reset", 0))
-                except (TypeError, ValueError):
-                    reset = 0
-                wait = max(5, reset - int(time.time()) + 2)
-                return min(wait, 3600)
-            if r.status_code == 403 and "rate limit" in r.text.lower():
-                # Secondary/abuse rate limit: no Retry-After or exhausted
-                # X-RateLimit-Remaining header, but GitHub still says to back
-                # off. Per GitHub's own guidance, wait at least 60s.
-                return 60
-        return None
+    def get(self, path, params=None):
+        """Single GET with the shared retry/backoff/rate-limit policy.
+
+        Bad auth (401/403 that isn't a rate limit) raises a catchable
+        `PlatformAuthError` instead of the old `SystemExit` -- one repo's bad
+        token now just fails that repo (see the per-project loop in main()),
+        instead of killing the whole batch run.
+        """
+        url = path if path.startswith("http") else self.api + path
+        response = request_with_retry(self.session, "GET", url, params=params)
+        if response is None:
+            return None
+        response.raise_for_status()
+        return response
 
     def paginate(self, path, params=None, limit=None):
+        url = path if path.startswith("http") else self.api + path
         params = dict(params or {})
         params.setdefault("per_page", 100)
-        params.setdefault("page", 1)
         results = []
-        while True:
+        while url:
             try:
-                r = self.get(path, params=params)
-            except SystemExit:
+                r = self.get(url, params=params)
+            except PlatformAuthError:
                 raise
             except Exception as e:
                 print(f"  [warn] pagination stopped early: {e}")
@@ -1109,9 +1079,19 @@ class GitHubProvider(HttpBase):
                 print(f"    ...{len(results)} items fetched")
             if limit and len(results) >= limit:
                 return results[:limit]
-            if len(data) < int(params["per_page"]):
-                break
-            params["page"] = int(params["page"]) + 1
+            # Follow the Link header's rel="next" URL -- the correct GitHub
+            # pagination contract (a full page isn't necessarily not-last,
+            # and a partial page isn't necessarily last, depending on
+            # upstream filtering).
+            next_url = None
+            for part in r.headers.get("Link", "").split(","):
+                if 'rel="next"' in part:
+                    m = re.search(r"<([^>]+)>", part)
+                    if m:
+                        next_url = m.group(1)
+                    break
+            url = next_url
+            params = {}  # next_url already carries its own query string
         return results
 
     # --- normalized interface ---
@@ -1230,23 +1210,21 @@ class GitHubProvider(HttpBase):
                 if t.get("type") == "blob"]
 
     def file_content(self, info, path):
+        # Needs a different Accept header (raw content, not JSON) than the
+        # provider's default -- bypasses self.get() for that reason, but
+        # still goes through the shared retry/backoff/rate-limit policy.
         url = (f"{self.api}/repos/{info['id']}/contents/{quote(path)}"
                f"?ref={quote(info['default_branch'], safe='')}")
-        for attempt in range(3):
-            try:
-                r = self.session.get(url, timeout=60,
-                                     headers={"Accept": "application/vnd.github.raw+json"})
-            except requests.RequestException:
-                time.sleep(2 ** attempt)
-                continue
-            wait = self._rate_limit_wait(r)
-            if wait is not None:
-                time.sleep(wait)
-                continue
-            if r.status_code != 200:
-                return None
-            return r.text
-        return None
+        try:
+            r = request_with_retry(
+                self.session, "GET", url,
+                headers={"Accept": "application/vnd.github.raw+json"},
+            )
+        except PlatformAuthError:
+            return None
+        if r is None or r.status_code != 200:
+            return None
+        return r.text
 
     def loc_estimate(self, info, code_paths):
         b = info.get("size_bytes", 0)

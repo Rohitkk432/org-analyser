@@ -1,14 +1,18 @@
-"""One redacting choke point for every OpenAI call.
+"""One redacting choke point for every LLM call (OpenAI, Azure, Gemini).
 
 Redaction used to be opt-in per call site, which is exactly why three sites
 (raw git diffs, PR bodies, human review comments) shipped unredacted for
-months. Construct clients with `safe_openai()` instead of `OpenAI()` and the
-redaction cannot be forgotten: it happens on the way out, inside the client.
+months. Construct clients with `safe_openai()` instead of `OpenAI()`, or call
+`safe_gemini()` instead of hand-rolling a Gemini request, and the redaction
+cannot be forgotten: it happens on the way out, inside the client/call.
 
     from llm_safety import safe_openai
     client = safe_openai()                    # instead of OpenAI()
     client.chat.completions.create(...)       # messages redacted in flight
     client.beta.chat.completions.parse(...)   # same
+
+    from llm_safety import safe_gemini
+    text = safe_gemini(prompt)                # instead of requests.post(...)
 
 Only secret *values* are replaced ([REDACTED]); prose, code structure, diff
 markers and identifiers are untouched, so classification quality is unaffected.
@@ -148,3 +152,55 @@ def safe_openai(**kwargs: Any) -> Any:
     from openai import OpenAI
 
     return _Guard(OpenAI(**kwargs))
+
+
+def gemini_available() -> bool:
+    """True if GEMINI_API_KEY is configured.
+
+    Separate from llm_available() deliberately: that check's callers never
+    touch Gemini, so folding it in would change what "available" means for
+    every existing OpenAI/Azure-only guard.
+    """
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def safe_gemini(
+    prompt: str,
+    model: str = "gemini-3-flash-preview",
+    api_key: str | None = None,
+) -> Any:
+    """Redacting drop-in for a raw Gemini `generateContent` call.
+
+    Gemini has no OpenAI-SDK-shaped client to wrap here, so this redacts the
+    prompt directly and does the REST call itself -- the same on-the-way-out
+    guarantee safe_openai() gives the OpenAI/Azure path. The key travels in
+    the `x-goog-api-key` header only, never the query string (a query-string
+    key lands in proxy logs, gateway logs, and shell history).
+
+    Returns the response text, or None on failure (network error or an
+    unexpected response shape) -- logged either way, never raised.
+    """
+    import requests
+
+    cleaned, found = redact_secrets(prompt)
+    total = sum(n for _, n in found)
+    if total:
+        logger.info("llm_safety: redacted %d secret(s) before sending to provider", total)
+
+    key = api_key or os.environ.get("GEMINI_API_KEY", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    try:
+        response = requests.post(
+            url,
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+            json={"contents": [{"role": "user", "parts": [{"text": cleaned}]}]},
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Gemini API failed: {exc}")
+        return None
+    except (KeyError, IndexError) as exc:
+        logger.error(f"Unexpected Gemini response: {exc}")
+        return None

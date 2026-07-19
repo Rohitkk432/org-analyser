@@ -1,9 +1,18 @@
-"""GitLab provider — REST v4 for projects, merge requests, fork status."""
+"""GitLab provider — REST v4 for projects, merge requests, fork status.
+
+Repo listing delegates its pagination to `platforms.gitlab.paginate`, which reads
+`X-Next-Page` case-insensitively via `platforms.base.ci_headers` -- HTTP/2 can lowercase
+that header, which silently capped this listing at 100 projects before.
+"""
 
 from __future__ import annotations
 
 import logging
 import urllib.parse
+
+import requests
+
+from platforms.gitlab import paginate
 
 from .base import GitProvider, ProviderError, RemoteRepo
 
@@ -23,21 +32,14 @@ class GitLabProvider(GitProvider):
 
     def list_repos(self, org: str) -> list[RemoteRepo]:
         group = urllib.parse.quote(org, safe="")
-        repos: list[RemoteRepo] = []
-        page = 1
-        while True:
-            url = (
-                f"{self.api}/groups/{group}/projects"
-                f"?per_page=100&page={page}&include_subgroups=true&archived=false"
-            )
-            data, headers = self._get_json(url)
-            if not data:
-                break
-            for p in data:
-                repos.append(self._to_repo(p))
-            if not headers.get("X-Next-Page"):
-                break
-            page += 1
+        session = requests.Session()
+        session.headers.update({"User-Agent": "codebase-profiler", **self._headers()})
+        items = paginate(
+            session,
+            f"{self.api}/groups/{group}/projects",
+            params={"include_subgroups": "true", "archived": "false"},
+        )
+        repos = [self._to_repo(p) for p in items]
         if not repos:
             raise ProviderError(f"no projects found for group '{org}' on {self.web_host}")
         return repos

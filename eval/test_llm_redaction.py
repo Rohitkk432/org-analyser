@@ -57,6 +57,21 @@ def test_common_tokens_redacted():
         assert leaked not in out, f"{leaked!r} survived redaction"
 
 
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeChatCompletion:
+    def __init__(self, content="{}"):
+        self.choices = [_FakeChoice(content)]
+
+
 class _FakeCompletions:
     """Stands in for the OpenAI SDK; records what it was actually sent."""
 
@@ -65,7 +80,7 @@ class _FakeCompletions:
 
     def create(self, **kwargs):
         self.seen = kwargs
-        return "ok"
+        return _FakeChatCompletion()
 
     parse = create
 
@@ -102,15 +117,62 @@ def test_wrapper_redacts_in_flight():
     assert inner.chat.completions.seen["model"] == "gpt-4o"
 
 
-def test_quality_evaluator_raw_path_redacts_whole_prompt():
-    # The raw requests path must redact every interpolated field, not just the
-    # diff -- a secret in commit_message or problem_statement must not escape.
-    import os
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeChatCompletion:
+    def __init__(self, content="{}"):
+        self.choices = [_FakeChoice(content)]
+
+
+def test_quality_evaluator_openai_path_redacts_whole_prompt():
+    # _call_openai now goes through eval.llm_safety.safe_openai(), not a raw
+    # requests.post -- every interpolated field (diff, commit_message,
+    # problem_statement) must still be redacted before it reaches the client.
+    import eval.quality_evaluator as qe
+
+    inner = _FakeClient()
+
+    saved_safe_openai = qe.safe_openai
+    try:
+        qe.safe_openai = lambda **kwargs: _Guard(inner)
+
+        ev = qe.QualityEvaluator(llm_provider="openai", api_key="test-key")
+        ev.evaluate_candidate(
+            src_diff="diff --git a/x b/x\n+++ b/x\n+print(1)\n",
+            test_diff="",
+            problem_statement="fix per sk-abcdefghijklmnopqrstuvwxyz012345",
+            commit_message="rotate ghp_abcdefghijklmnopqrstuvwxyz01",
+        )
+        body = str(inner.chat.completions.seen)
+        assert "ghp_abcdefghij" not in body, "commit_message secret reached provider"
+        assert "sk-abcdefghij" not in body, "problem_statement secret reached provider"
+        assert "REDACTED" in body
+    finally:
+        qe.safe_openai = saved_safe_openai
+
+
+def test_quality_evaluator_gemini_path_redacts_prompt():
+    # _call_gemini delegates entirely to eval.llm_safety.safe_gemini() -- this
+    # exercises that function's own redaction pass, not quality_evaluator's.
+    # requests.post is patched on the shared `requests` module object, so it's
+    # seen regardless of which module does `import requests` and calls it.
     import requests
+
+    import eval.quality_evaluator as qe
 
     captured = {}
 
     def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
         captured["body"] = json
 
         class R:
@@ -118,22 +180,15 @@ def test_quality_evaluator_raw_path_redacts_whole_prompt():
                 pass
 
             def json(self):
-                return {"choices": [{"message": {"content": "{}"}}]}
+                return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
 
         return R()
 
     saved_post = requests.post
-    saved_key = os.environ.get("OPENAI_API_KEY")
-    saved_az = {k: os.environ.get(k) for k in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY")}
     try:
         requests.post = fake_post
-        for k in saved_az:
-            os.environ.pop(k, None)
-        os.environ["OPENAI_API_KEY"] = "test-key"
 
-        import eval.quality_evaluator as qe
-
-        ev = qe.QualityEvaluator(llm_provider="openai")
+        ev = qe.QualityEvaluator(llm_provider="gemini", api_key="fake-gemini-key")
         ev.evaluate_candidate(
             src_diff="diff --git a/x b/x\n+++ b/x\n+print(1)\n",
             test_diff="",
@@ -144,15 +199,11 @@ def test_quality_evaluator_raw_path_redacts_whole_prompt():
         assert "ghp_abcdefghij" not in body, "commit_message secret reached provider"
         assert "sk-abcdefghij" not in body, "problem_statement secret reached provider"
         assert "REDACTED" in body
+        # Key travels in the header only, never the query string.
+        assert "fake-gemini-key" not in captured.get("url", "")
+        assert captured["headers"]["x-goog-api-key"] == "fake-gemini-key"
     finally:
         requests.post = saved_post
-        if saved_key is None:
-            os.environ.pop("OPENAI_API_KEY", None)
-        else:
-            os.environ["OPENAI_API_KEY"] = saved_key
-        for k, v in saved_az.items():
-            if v is not None:
-                os.environ[k] = v
 
 
 def test_azure_selection_and_deployment_remap():

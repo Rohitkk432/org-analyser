@@ -3,43 +3,31 @@
 A provider knows how to list an org/group's repos, resolve a single repo, build an
 authenticated clone URL, and fetch PR/MR review stats + fork status via the platform API.
 Tokens are passed in at construction and never persisted.
+
+HTTP transport is `requests`, routed through `platforms.base.request_with_retry` for the
+shared retry/backoff policy (network errors and rate limits are retried; profiler had no
+retry logic of its own before this). Case-insensitive header lookups (needed for GitLab's
+`X-Next-Page`, which HTTP/2 can lowercase) go through `platforms.base.ci_headers` rather
+than a local copy of that helper.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import ssl
-import urllib.error
 import urllib.parse
-import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-import certifi
+import requests
+
+from platforms.base import ci_headers, request_with_retry
+from platforms.errors import PlatformError
 
 logger = logging.getLogger(__name__)
-
-_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 class ProviderError(RuntimeError):
     """The hosting platform API failed."""
-
-
-class _CIHeaders(dict):
-    """Case-insensitive view of HTTP response headers.
-
-    HTTP/2 lowercases header names, so ``dict(resp.headers).get("X-Next-Page")`` can miss
-    a header that is actually present as ``x-next-page``. That silently capped GitLab
-    pagination (PR/MR counts, group repo lists) at the first 100 results.
-    """
-
-    def __init__(self, headers) -> None:
-        super().__init__((k.lower(), v) for k, v in headers.items())
-
-    def get(self, key, default=None):  # type: ignore[override]
-        return super().get(key.lower(), default)
 
 
 @dataclass
@@ -66,6 +54,7 @@ class GitProvider(ABC):
     def __init__(self, token: str | None = None, host: str | None = None) -> None:
         self.token = token
         self.host = host
+        self.session = requests.Session()
 
     # --- API surface used by remote.py and the VCS collector -----------------
     @abstractmethod
@@ -97,31 +86,34 @@ class GitProvider(ABC):
         return {}
 
     def _get_json(self, url: str):
-        req = urllib.request.Request(url, headers={"User-Agent": "codebase-profiler",
-                                                   **self._headers()})
+        headers = {"User-Agent": "codebase-profiler", **self._headers()}
         try:
-            with urllib.request.urlopen(req, timeout=60, context=_SSL_CONTEXT) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body), _CIHeaders(resp.headers)
-        except urllib.error.HTTPError as exc:
-            raise ProviderError(f"{exc.code} {exc.reason} for {url}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+            response = request_with_retry(self.session, "GET", url, headers=headers, timeout=60)
+        except (PlatformError, requests.exceptions.RequestException) as exc:
             raise ProviderError(f"network error for {url}: {exc}") from exc
+        if response is None:
+            raise ProviderError(f"404 Not Found for {url}")
+        if not response.ok:
+            raise ProviderError(f"{response.status_code} {response.reason} for {url}")
+        return response.json(), ci_headers(response.headers)
 
     def _post_json(self, url: str, payload: dict):
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={"User-Agent": "codebase-profiler", "Content-Type": "application/json",
-                     **self._headers()},
-        )
+        headers = {
+            "User-Agent": "codebase-profiler",
+            "Content-Type": "application/json",
+            **self._headers(),
+        }
         try:
-            with urllib.request.urlopen(req, timeout=120, context=_SSL_CONTEXT) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise ProviderError(f"{exc.code} {exc.reason} for {url}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+            response = request_with_retry(
+                self.session, "POST", url, headers=headers, json=payload, timeout=120
+            )
+        except (PlatformError, requests.exceptions.RequestException) as exc:
             raise ProviderError(f"network error for {url}: {exc}") from exc
+        if response is None:
+            raise ProviderError(f"404 Not Found for {url}")
+        if not response.ok:
+            raise ProviderError(f"{response.status_code} {response.reason} for {url}")
+        return response.json()
 
 
 def parse_repo_target(target: str) -> tuple[str | None, str, str]:

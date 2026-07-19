@@ -78,9 +78,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
+
+from platforms.base import request_with_retry
+from platforms.bitbucket import paginate as bitbucket_platform_paginate
+from platforms.github import github_headers
+from platforms.github import paginate as github_platform_paginate
+from platforms.gitlab import gitlab_headers
+from platforms.gitlab import paginate as gitlab_platform_paginate
 
 # ── Load .env file (same pattern as the rest of the project) ─────────────────
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
@@ -101,57 +109,30 @@ GITHUB_API_BASE = "https://api.github.com"
 
 
 class GitHubAPI:
-    """Thin wrapper around the GitHub REST API with pagination & rate-limit handling."""
+    """Thin wrapper around the GitHub REST API. Auth, retry/backoff, and
+    `Link`-header pagination live in `platforms.github` now -- this file's
+    previous `_paginate` inferred "last page" from a short batch, which is
+    wrong whenever a page happens to come back full but is actually the
+    last one; `platforms.github.paginate` follows the `Link` header instead.
+    """
 
     def __init__(self, token: str) -> None:
         self.session = requests.Session()
-        self.session.headers.update({
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "run-all-repos",
-        })
+        self.session.headers.update(github_headers(token))
+        self.session.headers["User-Agent"] = "org-analyser-run-all-repos"
 
     # ── low-level ────────────────────────────────────────────────────────────
 
-    def _request(self, method: str, url: str, **kw) -> requests.Response:
-        resp = self.session.request(method, url, timeout=60, **kw)
-        if resp.status_code == 403:
-            remaining = resp.headers.get("X-RateLimit-Remaining")
-            reset_at = resp.headers.get("X-RateLimit-Reset")
-            if remaining == "0" and reset_at:
-                wait = max(int(reset_at) - int(time.time()) + 2, 2)
-                print(f"  ⏳ Rate-limited — sleeping {wait}s …", file=sys.stderr)
-                time.sleep(wait)
-                resp = self.session.request(method, url, timeout=60, **kw)
-        return resp
-
     def _paginate(self, path: str, params: Optional[dict] = None) -> List[dict]:
         """Fetch all pages from a list endpoint."""
-        results: List[dict] = []
-        page = 1
-        while True:
-            merged = {"per_page": 100, "page": page}
-            if params:
-                merged.update(params)
-            resp = self._request("GET", f"{GITHUB_API_BASE}{path}", params=merged)
-            if resp.status_code >= 400:
-                print(f"  ⚠ API error {resp.status_code} for {path}: "
-                      f"{resp.text[:200]}", file=sys.stderr)
-                break
-            data = resp.json()
-            if not isinstance(data, list):
-                break
-            results.extend(data)
-            if len(data) < 100:
-                break
-            page += 1
-        return results
+        return github_platform_paginate(self.session, f"{GITHUB_API_BASE}{path}", params=params)
 
     # ── public helpers ───────────────────────────────────────────────────────
 
     def authenticated_user(self) -> dict:
-        resp = self._request("GET", f"{GITHUB_API_BASE}/user")
+        resp = request_with_retry(self.session, "GET", f"{GITHUB_API_BASE}/user")
+        if resp is None:
+            raise RuntimeError("GitHub /user request failed after retries")
         resp.raise_for_status()
         return resp.json()
 
@@ -190,14 +171,13 @@ class GitLabAPI:
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
-            "User-Agent": "run-all-repos",
+            "User-Agent": "org-analyser-run-all-repos",
         })
         # Will be set by authenticate()
         self._auth_resolved = False
 
     def _set_private_token(self) -> None:
-        self.session.headers.pop("Authorization", None)
-        self.session.headers["PRIVATE-TOKEN"] = self.token
+        self.session.headers.update(gitlab_headers(self.token))
 
     def _set_bearer(self) -> None:
         self.session.headers.pop("PRIVATE-TOKEN", None)
@@ -206,6 +186,14 @@ class GitLabAPI:
     # ── low-level ────────────────────────────────────────────────────────────
 
     def _request(self, method: str, url: str, **kw) -> requests.Response:
+        """Plain request, retried once on 429 -- deliberately NOT routed
+        through `request_with_retry`: `_try_auth` below inspects 401/403
+        responses directly as normal, expected probe outcomes (a token might
+        only work for /groups, not /user), and `request_with_retry` raises
+        `PlatformAuthError` on exactly those statuses. That contract is right
+        for "fetch this resource," wrong for "probe whether this auth mode
+        works" -- so this stays a plain, non-raising request.
+        """
         resp = self.session.request(method, url, timeout=60, **kw)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", "5"))
@@ -215,28 +203,8 @@ class GitLabAPI:
         return resp
 
     def _paginate(self, url: str, params: Optional[dict] = None) -> List[dict]:
-        """Fetch all pages from a list endpoint using page pagination."""
-        results: List[dict] = []
-        page = 1
-        while True:
-            merged = {"per_page": 100, "page": page}
-            if params:
-                merged.update(params)
-            resp = self._request("GET", url, params=merged)
-            if resp.status_code >= 400:
-                print(f"  ⚠ GitLab API error {resp.status_code} for {url}: "
-                      f"{resp.text[:200]}", file=sys.stderr)
-                break
-            data = resp.json()
-            if not isinstance(data, list):
-                break
-            results.extend(data)
-            # Check X-Next-Page header (GitLab specific)
-            next_page = resp.headers.get("X-Next-Page", "")
-            if not next_page or len(data) < 100:
-                break
-            page = int(next_page)
-        return results
+        """Fetch all pages from a list endpoint, following X-Next-Page."""
+        return gitlab_platform_paginate(self.session, url, params=params)
 
     # ── public helpers ───────────────────────────────────────────────────────
 
@@ -372,7 +340,7 @@ class BitbucketAPI:
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
-            "User-Agent": "run-all-repos",
+            "User-Agent": "org-analyser-run-all-repos",
         })
         self._auth_mode = ""
 
@@ -428,19 +396,10 @@ class BitbucketAPI:
         return resp
 
     def _paginate(self, url: str, params: Optional[dict] = None) -> List[dict]:
-        """Fetch all pages from a list endpoint using Bitbucket's next-link pagination."""
-        results: List[dict] = []
-        while url:
-            resp = self._request("GET", url, params=params)
-            if resp.status_code >= 400:
-                print(f"  ⚠ Bitbucket API error {resp.status_code} for {url}: "
-                      f"{resp.text[:200]}", file=sys.stderr)
-                break
-            data = resp.json()
-            results.extend(data.get("values", []))
-            url = data.get("next")
-            params = None  # next URL already includes query params
-        return results
+        """Fetch all pages, following Bitbucket's `next` cursor URL field."""
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        return bitbucket_platform_paginate(self.session, url)
 
     def authenticated_user(self) -> dict:
         return self.authenticate()

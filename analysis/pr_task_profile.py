@@ -82,6 +82,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from platforms.base import request_with_retry
+from platforms.bitbucket import bitbucket_headers
+from platforms.bitbucket import paginate as bitbucket_platform_paginate
+from platforms.github import github_headers
+from platforms.github import paginate as github_platform_paginate
+from platforms.gitlab import gitlab_headers
+from platforms.gitlab import paginate as gitlab_platform_paginate
+
 # Shared redacting OpenAI client. This script sends PR titles, bodies and human
 # review comments, so it must not construct a bare OpenAI() client.
 from eval.llm_safety import llm_available, safe_openai
@@ -347,46 +355,32 @@ def github_graphql(
     variables: Dict[str, Any],
     max_retries: int = 12,
 ) -> Dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
+    """POST a GraphQL query, retrying on GitHub's body-level RATE_LIMITED error.
 
-    last_err: Optional[str] = None
+    Network errors, HTTP 429/5xx, and header-based rate limits are handled by
+    the shared `request_with_retry` policy. GraphQL has its own rate-limit
+    signal on top of that -- a 200 OK response whose `errors` array carries
+    `type: RATE_LIMITED` -- which is invisible to a plain HTTP-status-based
+    retry policy, so it still needs its own loop here.
+    """
+    session = requests.Session()
+    session.headers.update(github_headers(token))
+
     for attempt in range(1, max_retries + 1):
-        try:
-            response = requests.post(
-                GITHUB_GRAPHQL_URL,
-                headers=headers,
-                json={"query": query, "variables": variables},
-                timeout=60,
-            )
-        except requests.RequestException as exc:
-            last_err = f"network error: {exc}"
-            logger.warning("GraphQL request failed (attempt %d/%d): %s", attempt, max_retries, exc)
-            time.sleep(min(2 ** attempt, 30))
-            continue
-
-        if response.status_code in (403, 429, 502, 503, 504):
-            retry_after = response.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 60)
-            last_err = f"transient HTTP {response.status_code}: {response.text[:200]}"
-            logger.warning(
-                "GitHub transient error (status %s). Waiting %ss (attempt %d/%d).",
-                response.status_code, wait, attempt, max_retries,
-            )
-            time.sleep(wait)
-            continue
-
-        if response.status_code >= 400:
-            raise RuntimeError(f"GitHub API error: {response.status_code} {response.text}")
+        response = request_with_retry(
+            session,
+            "POST",
+            GITHUB_GRAPHQL_URL,
+            json={"query": query, "variables": variables},
+        )
+        if response is None:
+            raise RuntimeError("GitHub GraphQL failed: no response after retries")
 
         payload = response.json()
         if "errors" in payload:
             errors = payload["errors"]
             if any(err.get("type") == "RATE_LIMITED" for err in errors):
                 wait = _wait_for_rate_limit(response, attempt)
-                last_err = f"GraphQL rate limited: {json.dumps(errors)[:200]}"
                 logger.warning(
                     "GitHub GraphQL rate limit. Waiting %ss (attempt %d/%d).",
                     wait, attempt, max_retries,
@@ -396,7 +390,7 @@ def github_graphql(
             raise RuntimeError(f"GraphQL errors: {json.dumps(errors, indent=2)}")
         return payload["data"]
 
-    raise RuntimeError(f"GitHub GraphQL failed after {max_retries} retries. Last error: {last_err}")
+    raise RuntimeError(f"GitHub GraphQL failed after {max_retries} retries (rate limited).")
 
 
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -495,34 +489,15 @@ def gitlab_rest_get(
     params: Optional[Dict[str, Any]] = None,
     max_retries: int = 8,
 ) -> Any:
-    headers = {"PRIVATE-TOKEN": token, "User-Agent": "org-analyser-pr-task-profile"}
+    session = requests.Session()
+    session.headers.update(gitlab_headers(token))
     url = f"{GITLAB_REST_URL}{path}"
-    last_err: Optional[str] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=120)
-        except requests.RequestException as exc:
-            last_err = f"network error: {exc}"
-            logger.warning("GitLab REST failed (attempt %d/%d): %s", attempt, max_retries, exc)
-            time.sleep(min(2 ** attempt, 30))
-            continue
-        if response.status_code in (429, 502, 503, 504):
-            wait = min(2 ** attempt, 60)
-            last_err = f"HTTP {response.status_code}"
-            logger.warning(
-                "GitLab transient error (status %s). Waiting %ss (attempt %d/%d).",
-                response.status_code, wait, attempt, max_retries,
-            )
-            time.sleep(wait)
-            continue
-        if response.status_code == 404:
-            raise RuntimeError(f"GitLab REST 404 (not found or no access): {url}")
-        if response.status_code >= 400:
-            raise RuntimeError(f"GitLab REST error: {response.status_code} {response.text[:300]}")
-        if response.status_code == 204 or not response.text:
-            return None
-        return response.json()
-    raise RuntimeError(f"GitLab REST failed after {max_retries} retries. Last error: {last_err}")
+    response = request_with_retry(session, "GET", url, params=params, max_retries=max_retries)
+    if response is None:
+        raise RuntimeError(f"GitLab REST request failed (not found, no access, or exhausted retries): {url}")
+    if response.status_code == 204 or not response.text:
+        return None
+    return response.json()
 
 
 def gitlab_rest_paginated(
@@ -530,21 +505,10 @@ def gitlab_rest_paginated(
     path: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> List[Any]:
-    results: List[Any] = []
-    page = 1
-    base_params = dict(params or {})
-    while True:
-        page_params = dict(base_params)
-        page_params["per_page"] = 100
-        page_params["page"] = page
-        batch = gitlab_rest_get(token, path, page_params)
-        if not isinstance(batch, list) or not batch:
-            break
-        results.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return results
+    session = requests.Session()
+    session.headers.update(gitlab_headers(token))
+    url = f"{GITLAB_REST_URL}{path}"
+    return gitlab_platform_paginate(session, url, params=params)
 
 
 def list_gitlab_group_projects(
@@ -748,23 +712,6 @@ def fetch_merged_gitlab_mrs(
 # Bitbucket (REST 2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _bitbucket_auth_header(token: str, username: str = "") -> str:
-    import base64
-    user = username.strip()
-    if user:
-        # App password (Bitbucket username) or Atlassian API token (email) → Basic.
-        return "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
-    if token.startswith("ATATT"):
-        # The static "x-bitbucket-api-token-auth" user works for git but NOT the
-        # REST API — it returns a misleading "Token is invalid".
-        raise RuntimeError(
-            "Atlassian API token (ATATT…) needs your Atlassian account email. "
-            "Set bitbucket_username to that email in the tokens file."
-        )
-    # Workspace/Repository/Project access token → Bearer.
-    return "Bearer " + token
-
-
 def bitbucket_rest_get(
     token: str,
     url: str,
@@ -772,56 +719,21 @@ def bitbucket_rest_get(
     max_retries: int = 8,
 ) -> Any:
     """GET an absolute Bitbucket URL, with the same retry discipline as GitLab."""
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "pr_task_profile_report",
-    }
-    if token:  # anonymous when absent: works for public repos (lower rate limit)
-        headers["Authorization"] = _bitbucket_auth_header(token, username)
-    last_err: Optional[str] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = requests.get(url, headers=headers, timeout=120)
-        except requests.RequestException as exc:
-            last_err = f"network error: {exc}"
-            logger.warning("Bitbucket REST failed (attempt %d/%d): %s", attempt, max_retries, exc)
-            time.sleep(min(2 ** attempt, 30))
-            continue
-        if response.status_code in (429, 502, 503, 504):
-            wait = min(2 ** attempt, 60)
-            last_err = f"HTTP {response.status_code}"
-            logger.warning(
-                "Bitbucket transient error (status %s). Waiting %ss (attempt %d/%d).",
-                response.status_code, wait, attempt, max_retries,
-            )
-            time.sleep(wait)
-            continue
-        if response.status_code == 404:
-            raise RuntimeError(f"Bitbucket REST 404 (not found or no access): {url}")
-        if response.status_code >= 400:
-            raise RuntimeError(f"Bitbucket REST error: {response.status_code}")
-        if response.status_code == 204 or not response.text:
-            return None
-        try:
-            return response.json()
-        except ValueError:
-            wait = min(2 ** attempt, 60)
-            last_err = "non-JSON body"
-            time.sleep(wait)
-            continue
-    raise RuntimeError(f"Bitbucket REST failed after {max_retries} retries. Last error: {last_err}")
+    session = requests.Session()
+    session.headers.update(bitbucket_headers(token, username))
+    response = request_with_retry(session, "GET", url, max_retries=max_retries)
+    if response is None:
+        raise RuntimeError(f"Bitbucket REST request failed (not found, no access, or exhausted retries): {url}")
+    if response.status_code == 204 or not response.text:
+        return None
+    return response.json()
 
 
 def bitbucket_rest_paginated(token: str, url: str, username: str = "") -> List[Any]:
     """Follow Bitbucket's `next` cursor, collecting every `values` item."""
-    results: List[Any] = []
-    while url:
-        page = bitbucket_rest_get(token, url, username)
-        if not isinstance(page, dict):
-            break
-        results.extend(page.get("values", []))
-        url = page.get("next", "")
-    return results
+    session = requests.Session()
+    session.headers.update(bitbucket_headers(token, username))
+    return bitbucket_platform_paginate(session, url)
 
 
 def _bitbucket_actor(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1016,58 +928,20 @@ def github_rest_get(
     params: Optional[Dict[str, Any]] = None,
     max_retries: int = 5,
 ) -> Any:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
+    session = requests.Session()
+    session.headers.update(github_headers(token))
     url = f"{GITHUB_REST_URL}{path}"
-
-    last_err: Optional[str] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=60)
-        except requests.RequestException as exc:
-            last_err = f"network error: {exc}"
-            logger.warning("REST request failed (attempt %d/%d): %s", attempt, max_retries, exc)
-            time.sleep(min(2 ** attempt, 30))
-            continue
-
-        if response.status_code in (403, 429):
-            retry_after = response.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 60)
-            last_err = f"rate limited: {response.status_code} {response.text[:200]}"
-            logger.warning(
-                "GitHub REST rate limit (status %s). Waiting %ss (attempt %d/%d).",
-                response.status_code, wait, attempt, max_retries,
-            )
-            time.sleep(wait)
-            continue
-
-        if response.status_code == 404:
-            raise RuntimeError(f"GitHub REST 404 (not found or no access): {url}")
-        if response.status_code >= 400:
-            raise RuntimeError(f"GitHub REST error: {response.status_code} {response.text}")
-
-        return response.json()
-
-    raise RuntimeError(f"GitHub REST failed after {max_retries} retries. Last error: {last_err}")
+    response = request_with_retry(session, "GET", url, params=params, max_retries=max_retries)
+    if response is None:
+        raise RuntimeError(f"GitHub REST request failed (not found, no access, or exhausted retries): {url}")
+    return response.json()
 
 
 def github_rest_paginated(token: str, path: str, params: Dict[str, Any]) -> List[Any]:
-    results: List[Any] = []
-    page = 1
-    while True:
-        page_params = dict(params)
-        page_params["per_page"] = 100
-        page_params["page"] = page
-        batch = github_rest_get(token, path, page_params)
-        if not isinstance(batch, list) or not batch:
-            break
-        results.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return results
+    session = requests.Session()
+    session.headers.update(github_headers(token))
+    url = f"{GITHUB_REST_URL}{path}"
+    return github_platform_paginate(session, url, params=params)
 
 
 def get_owner_type(token: str, owner: str) -> str:

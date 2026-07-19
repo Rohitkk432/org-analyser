@@ -23,7 +23,6 @@ import logging
 import os
 import re
 import sys
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +30,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
+
+from platforms.github import github_headers
+from platforms.github import paginate as github_platform_paginate
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
@@ -220,71 +222,20 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 
 class GitHubClient:
+    """Thin wrapper over `platforms.github` -- auth, retry/backoff, and
+    `Link`-header pagination all live there now; this just adapts the
+    relative-path/params calling convention this file's callers already use.
+    """
+
     def __init__(self, token: Optional[str]) -> None:
         self.session = requests.Session()
-        h = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "data-tech-cybersecurity-pr-scanner",
-        }
-        if token:
-            h["Authorization"] = f"Bearer {token}"
-        self.session.headers.update(h)
-
-    def _request(self, method: str, url: str, **kw) -> requests.Response:
-        resp = self.session.request(method, url, timeout=120, **kw)
-        if resp.status_code == 403:
-            rem = resp.headers.get("X-RateLimit-Remaining")
-            reset = resp.headers.get("X-RateLimit-Reset")
-            if rem == "0" and reset:
-                wait = max(int(reset) - int(time.time()) + 2, 2)
-                logger.warning("GitHub rate limited — sleeping %ds …", wait)
-                time.sleep(wait)
-                resp = self.session.request(method, url, timeout=120, **kw)
-        return resp
-
+        self.session.headers.update(github_headers(token or ""))
+        self.session.headers["User-Agent"] = "org-analyser-cybersecurity-pr-scanner"
 
     def paginate(self, path: str, params: Optional[dict] = None) -> List[dict]:
-        out: List[dict] = []
-        url: Optional[str] = f"{GITHUB_API}{path}"
-        q = dict(params or {})
-        short = path.split("?", 1)[0]
-        page_idx = 0
-        while url:
-            page_idx += 1
-            r = self._request("GET", url, params=q if url.startswith(GITHUB_API) else None)
-            q = {}
-            if r.status_code >= 400:
-                r.raise_for_status()
-            batch = r.json()
-            if not isinstance(batch, list):
-                logger.error("Paginate expected list JSON from %s, got %s", short, type(batch).__name__)
-                break
-            n = len(batch)
-            out.extend(batch)
-            rem = r.headers.get("X-RateLimit-Remaining")
-            logger.debug(
-                "GitHub page %d: %s — +%d row(s); cumulative %d · rate_remaining=%s",
-                page_idx,
-                short,
-                n,
-                len(out),
-                rem if rem is not None else "?",
-            )
-            link = r.headers.get("Link", "")
-            url = None
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    m = re.search(r"<([^>]+)>", part)
-                    if m:
-                        url = m.group(1)
-                    break
-        logger.info(
-            "GitHub paginate done %s — %d row(s) in %d HTTP page(s)",
-            short,
-            len(out),
-            page_idx,
-        )
+        url = f"{GITHUB_API}{path}"
+        out = github_platform_paginate(self.session, url, params=params)
+        logger.info("GitHub paginate done %s — %d row(s)", path.split("?", 1)[0], len(out))
         return out
 
 

@@ -129,26 +129,12 @@ except Exception:
         normalize_to_utc,
     )
 
-try:
-    from .platform_clients import (
-        BitbucketClient,
-        GitHubClient,
-        GitLabClient,
-        LocalClient,
-        PlatformClient,
-        SvnClient,
-        detect_platform,
-    )
-except Exception:
-    from eval.platform_clients import (
-        BitbucketClient,
-        GitHubClient,
-        GitLabClient,
-        LocalClient,
-        PlatformClient,
-        SvnClient,
-        detect_platform,
-    )
+from platforms.base import PlatformClient, detect_platform
+from platforms.bitbucket import BitbucketClient
+from platforms.github import GitHubClient
+from platforms.gitlab import GitLabClient
+from platforms.local import LocalClient
+from platforms.svn import SvnClient
 
 try:
     from .quality_checks import run_all_quality_checks

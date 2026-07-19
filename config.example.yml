@@ -18,6 +18,8 @@ tokens:
                              # leave blank when using a workspace/repo access token
   openai_key: null          # sk-... — required unless OPENAI_API_KEY is set in the environment,
                              # or Azure OpenAI is configured (AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY)
+  gemini_key: null          # only needed when pr_rubrics_provider: gemini below; same effect as
+                             # setting GEMINI_API_KEY in the environment
 
 # Optional: path to a separate key=value tokens file instead of the `tokens:`
 # mapping above (same key names). Only set this if you want tokens split out
@@ -58,6 +60,10 @@ skip_quality_score: false
 # Skip F2P/P2P test verification in eval-kit (the slowest phase: it installs
 # deps and runs the test suite per accepted PR). Recommended for large repos.
 skip_f2p: false
+
+# LLM provider for eval-kit's PR-rubrics scoring: "openai" (OPENAI_API_KEY /
+# Azure) or "gemini" (GEMINI_API_KEY / gemini_key above).
+pr_rubrics_provider: openai
 
 # Never contact a remote API. Runs only the code-based analyses on local
 # checkouts and skips PR-based phases, even if a checkout still has an

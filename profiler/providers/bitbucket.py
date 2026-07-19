@@ -1,4 +1,12 @@
-"""Bitbucket Cloud provider — REST 2.0 for repos, pull requests, fork status."""
+"""Bitbucket Cloud provider — REST 2.0 for repos, pull requests, fork status.
+
+Auth decisions (Basic vs. Bearer, and the git-clone-specific ATATT sentinel) delegate to
+`platforms.bitbucket.resolve_bitbucket_auth`/`resolve_bitbucket_git_auth`, the single
+source of truth for that 3-branch decision. Username resolution from the environment
+(`BITBUCKET_USERNAME`, falling back to `ATLASSIAN_EMAIL`/`BITBUCKET_EMAIL`) stays here --
+`platforms.bitbucket`'s functions take username as an explicit parameter, not an env
+lookup, since not every caller resolves it from the same place.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +14,9 @@ import base64
 import logging
 import os
 import urllib.parse
+
+from platforms.bitbucket import resolve_bitbucket_auth, resolve_bitbucket_git_auth
+from platforms.errors import PlatformAuthError
 
 from .base import GitProvider, ProviderError, RemoteRepo
 
@@ -25,47 +36,40 @@ class BitbucketProvider(GitProvider):
             self.api = f"https://{self.web_host}/rest/api/1.0"
         self.username = os.environ.get("BITBUCKET_USERNAME")
 
-    def _basic_user(self) -> str | None:
-        """User/email for HTTP Basic auth.
+    def _resolved_username(self) -> str:
+        """User/email to feed into `platforms.bitbucket`'s auth functions.
 
-        Atlassian API tokens (ATATT…) must use the Atlassian account *email*.
-        Bitbucket app passwords must use the Bitbucket *username* (not email).
+        Atlassian API tokens (ATATT…) must use the Atlassian account *email*, so that
+        branch skips `BITBUCKET_USERNAME` entirely and looks only at the email vars.
+        Bitbucket app passwords (or workspace access tokens) use the Bitbucket
+        *username* (not email), preferring `BITBUCKET_USERNAME`.
         """
         if self.token and self.token.startswith("ATATT"):
             for key in ("ATLASSIAN_EMAIL", "BITBUCKET_EMAIL"):
                 val = os.environ.get(key)
                 if val:
                     return val
-            return None
+            return ""
         if self.username:
             return self.username
         for key in ("ATLASSIAN_EMAIL", "BITBUCKET_EMAIL"):
             val = os.environ.get(key)
             if val:
                 return val
-        return None
-
-    def _uses_basic_auth(self) -> bool:
-        if self._basic_user():
-            return True
-        # Atlassian account API tokens from id.atlassian.com — Basic only, not Bearer.
-        return bool(self.token and self.token.startswith("ATATT"))
-
-    def _basic_auth_header(self) -> dict[str, str]:
-        user = self._basic_user()
-        if not user:
-            raise ProviderError(
-                "Atlassian API token (ATATT...) requires ATLASSIAN_EMAIL set to your "
-                "Atlassian account email (the one you log into Bitbucket with)."
-            )
-        raw = f"{user}:{self.token}".encode()
-        return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
+        return ""
 
     def _headers(self) -> dict[str, str]:
         if not self.token:
             return {}
-        if self._uses_basic_auth():
-            return self._basic_auth_header()
+        try:
+            scheme, user = resolve_bitbucket_auth(self.token, self._resolved_username())
+        except PlatformAuthError as exc:
+            # Re-raise as ProviderError -- this module's own exception contract, which
+            # every caller in profiler/ already catches instead of platforms/'s types.
+            raise ProviderError(str(exc)) from exc
+        if scheme == "basic":
+            raw = f"{user}:{self.token}".encode()
+            return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
         return {"Authorization": f"Bearer {self.token}"}
 
     def list_repos(self, org: str) -> list[RemoteRepo]:
@@ -181,14 +185,11 @@ class BitbucketProvider(GitProvider):
     def auth_clone_url(self, repo: RemoteRepo) -> str:
         if not self.token:
             return repo.clone_url
-        if self._uses_basic_auth():
-            user = self._basic_user()
-            if not user:
-                raise ProviderError(
-                    "Atlassian API token (ATATT...) requires ATLASSIAN_EMAIL for git clone."
-                )
-        else:
-            user = "x-bitbucket-api-token-auth"
+        # git-clone-over-HTTPS, not the REST API -- resolve_bitbucket_git_auth, not
+        # resolve_bitbucket_auth. Git accepts the "x-bitbucket-api-token-auth" sentinel
+        # for an Atlassian API token (ATATT...) regardless of any configured username;
+        # the REST API has no such allowance and requires the real account email instead.
+        user = resolve_bitbucket_git_auth(self.token, self._resolved_username())
         return repo.clone_url.replace(
             "https://",
             f"https://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(self.token, safe='')}@",

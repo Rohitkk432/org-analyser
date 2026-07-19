@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from platforms.base import ci_headers
+
 USER_AGENT = "repo-mirror/1.0"
 TOKEN_KEYS = ("gitlab_token",)
 
@@ -194,7 +196,10 @@ class GitLabClient:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 body = resp.read()
                 data = json.loads(body.decode("utf-8")) if body else []
-                headers = {k: v for k, v in resp.headers.items()}
+                # Case-insensitive lookup -- HTTP/2 can lowercase header names,
+                # which silently capped this at the first 100 results whenever
+                # a case-sensitive `headers.get("X-Next-Page")` missed it.
+                headers = ci_headers(resp.headers)
             if not isinstance(data, list):
                 return data if data is not None else items
             items.extend(data)

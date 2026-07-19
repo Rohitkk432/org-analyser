@@ -1,8 +1,17 @@
-"""GitHub provider — REST for listing/repo metadata, GraphQL for PR review stats."""
+"""GitHub provider — REST for listing/repo metadata, GraphQL for PR review stats.
+
+Repo listing delegates its pagination to `platforms.github.paginate`, which follows the
+`Link` response header (`rel="next"`) per GitHub's actual pagination contract, instead of
+looping page numbers until an empty page comes back.
+"""
 
 from __future__ import annotations
 
 import logging
+
+import requests
+
+from platforms.github import github_api, paginate
 
 from .base import GitProvider, ProviderError, RemoteRepo
 
@@ -27,7 +36,7 @@ class GitHubProvider(GitProvider):
         super().__init__(token, host)
         # Supports GitHub Enterprise via a custom host.
         base = host or "github.com"
-        self.api = "https://api.github.com" if base == "github.com" else f"https://{base}/api/v3"
+        self.api = github_api(base)
         self.graphql = (
             "https://api.github.com/graphql" if base == "github.com"
             else f"https://{base}/api/graphql"
@@ -41,28 +50,14 @@ class GitHubProvider(GitProvider):
         return h
 
     def list_repos(self, org: str) -> list[RemoteRepo]:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "codebase-profiler", **self._headers()})
         repos: list[RemoteRepo] = []
-        for kind in (f"orgs/{org}", f"users/{org}"):
-            page = 1
-            ok = False
-            while True:
-                url = f"{self.api}/{kind}/repos?per_page=100&page={page}&type=all"
-                try:
-                    data, _ = self._get_json(url)
-                except ProviderError as exc:
-                    if page == 1:
-                        break  # try the next kind (user vs org)
-                    raise exc
-                if not data:
-                    break
-                ok = True
-                for r in data:
-                    if r.get("archived"):
-                        continue
-                    repos.append(self._to_repo(r))
-                page += 1
-            if ok:
-                break
+        for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
+            items = paginate(session, f"{self.api}/{kind}", params={"per_page": 100, "type": "all"})
+            if items:
+                repos = [self._to_repo(r) for r in items if not r.get("archived")]
+                break  # this kind (org vs user) resolved; don't also try the other
         if not repos:
             raise ProviderError(f"no repositories found for '{org}' on {self.web_host}")
         return repos
