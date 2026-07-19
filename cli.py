@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -162,6 +163,12 @@ from platforms.bitbucket import resolve_bitbucket_git_auth  # noqa: E402
 GITHUB_TOKEN_NAME = "github-data-token"
 GITLAB_TOKEN_NAME = "gitlab_token"
 BITBUCKET_TOKEN_NAME = "bitbucket_token"
+
+# Every per-repo profiler row appends to one shared workbook, but the per-repo
+# phases run concurrently — openpyxl load→save isn't atomic and an xlsx is a
+# zip, so parallel writers corrupt it (BadZipFile) and fail on Windows file
+# locks. Serialise the append (see run_profiler).
+_PROFILER_WRITE_LOCK = threading.Lock()
 # Optional: for Bitbucket app passwords, which authenticate as username+password.
 # With a workspace/repo access token, leave the username blank.
 BITBUCKET_USERNAME_NAME = "bitbucket_username"
@@ -944,7 +951,8 @@ def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
             originating_company=entry.org,
             repo_name=entry.repo_slug,
         )
-        append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
+        with _PROFILER_WRITE_LOCK:
+            append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
         return True, f"profiler ok ({len(result.values)} fields){remote_note}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
