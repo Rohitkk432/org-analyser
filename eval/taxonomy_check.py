@@ -423,6 +423,9 @@ def run_taxonomy_for_accepted_prs(
     skip_taxonomy: bool = False,
     pr_number: int | None = None,
     concurrency: int = 8,
+    batch_work_dir: Path | None = None,
+    llm_mode: str = "auto",
+    llm_batch_threshold: int = 50,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     Classify each accepted PR; aggregate successful rows into repo-level columns.
@@ -435,7 +438,7 @@ def run_taxonomy_for_accepted_prs(
     if skip_taxonomy:
         return dict(_EMPTY_RESULT), empty_per_pr
 
-    from eval.llm_safety import llm_available
+    from llm.llm_safety import llm_available
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not llm_available():
@@ -494,7 +497,13 @@ def run_taxonomy_for_accepted_prs(
             model=model,
             concurrency=max(1, int(concurrency)),
         )
-        raw_results = classifier.classify_batch(items)
+        raw_results = classifier.classify_batch(
+            items,
+            batch_work_dir=batch_work_dir or (Path("outputs") / "batch_state" / "taxonomy" / f"{owner}_{repo}"),
+            llm_mode=llm_mode,
+            llm_batch_threshold=llm_batch_threshold,
+            tag=f"{owner}_{repo}",
+        )
     except Exception as e:
         logger.warning(
             "Taxonomy batch classification failed for %s/%s: %s", owner, repo, e
@@ -551,7 +560,7 @@ def run_taxonomy_classification(
     if skip_taxonomy:
         return dict(_EMPTY_RESULT)
 
-    from eval.llm_safety import llm_available
+    from llm.llm_safety import llm_available
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not llm_available():

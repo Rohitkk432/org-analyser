@@ -91,11 +91,13 @@ The F2P/P2P analysis runs the target repo's own build and test commands — `mak
 
 ### 4.2 Secrets cannot reach an LLM provider
 
-**Guarantee:** every OpenAI client in the repo is constructed by [`llm_safety.safe_openai()`](eval/llm_safety.py#L120), which returns a guarded client that redacts `messages` (and Responses-API `input`) **on the way out**. Redaction is a property of the client, not a step a call site has to remember.
+**Guarantee:** every OpenAI client in the repo is constructed by [`llm_safety.safe_openai()`](llm/llm_safety.py#L121), which returns a guarded client that redacts `messages` (and Responses-API `input`) **on the way out**. Redaction is a property of the client, not a step a call site has to remember.
 
 **Why it holds:** redaction used to be opt-in per call site, and was wired into only four of seven — which is precisely how raw git diffs, PR bodies, and human review comments came to be shipped unredacted. Moving it into the client removes the failure mode rather than patching its instances.
 
-**Check:** `grep -rn '= OpenAI(' .` returns nothing outside the wrapper itself. `python test_llm_redaction.py` drives a fake client and asserts no key material reaches it.
+**Check:** `grep -rn '= OpenAI(' .` returns nothing outside the wrapper itself. `python -m llm.test_llm_redaction` (from repo root) drives a fake client and asserts no key material reaches it.
+
+**`--local-only`:** quality-check LLM analysis and PR-rubrics scoring are both skipped (`--skip-quality-llm`, `--skip-pr-rubrics` in [cli.py](cli.py)'s `run_eval_kit()`), and `preflight()` no longer requires an LLM key for this mode — no repo content reaches an LLM provider when set.
 
 **Quality is unaffected.** Only secret *values* are replaced. Prose, code structure, diff markers and identifiers pass through untouched — asserted explicitly in `test_wrapper_redacts_in_flight`.
 
@@ -171,18 +173,18 @@ Under the owner-run model, the surviving compliance obligations are operational,
 ## 8. Verification
 
 ```console
-$ cd eval
-
-$ python test_env_scrub.py
-OK: repo commands run credential-free
-
-$ python test_llm_redaction.py
+$ python -m llm.test_llm_redaction
   ok  test_common_tokens_redacted
   ok  test_private_key_fully_redacted
   ok  test_private_key_in_diff
   ok  test_stats_never_overclaim
   ok  test_wrapper_redacts_in_flight
 OK: no secret reaches an LLM provider
+
+$ cd eval
+
+$ python test_env_scrub.py
+OK: repo commands run credential-free
 
 $ python test_hostile_repo.py
   runner: pytest

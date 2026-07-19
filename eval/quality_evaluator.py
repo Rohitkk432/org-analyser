@@ -5,12 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-try:
-    from .credential_redactor import redact_diff, redact_secrets, redaction_summary
-    from .llm_safety import safe_gemini, safe_openai
-except ImportError:  # invoked as a top-level script (cwd=eval)
-    from credential_redactor import redact_diff, redact_secrets, redaction_summary
-    from llm_safety import safe_gemini, safe_openai
+from llm.credential_redactor import redact_diff, redact_secrets, redaction_summary
+from llm.llm_safety import safe_gemini, safe_openai
 
 logger = logging.getLogger(__name__)
 
