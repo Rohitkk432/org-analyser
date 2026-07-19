@@ -21,6 +21,7 @@ polling that same batch instead of submitting a duplicate.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from llm.credential_redactor import redact_secrets
+
+logger = logging.getLogger(__name__)
 
 # OpenAI Batch API limits (as of writing): 50,000 requests or 200MB per input
 # file, whichever comes first. Staying a bit under the byte limit leaves
@@ -146,11 +149,51 @@ def run_batch_chunk(
             input_file_id=upload.id, endpoint="/v1/chat/completions", completion_window="24h"
         )
         batch_id = batch.id
-        state = {"batch_id": batch_id, "status": batch.status, "input_file": str(input_path)}
+        state = {
+            "batch_id": batch_id,
+            "status": batch.status,
+            "input_file": str(input_path),
+            "request_count": len(items),
+        }
         state_file.save(state)
+        logger.info(
+            "Batch %s submitted: %d requests (chunk=%s, window=24h)",
+            batch_id, len(items), chunk_tag,
+        )
+    else:
+        logger.info(
+            "Resuming batch %s (chunk=%s, last status=%s)",
+            batch_id, chunk_tag, state.get("status", "unknown"),
+        )
+
+    # Persist and log every observed stage transition (validating ->
+    # in_progress -> finalizing -> ...) and completed-count change, not just
+    # the terminal state: the state sidecar is the only window another
+    # process (the pipeline's progress UI, a human with cat) has into a wait
+    # that can legitimately last hours, and it doubles as the resume record.
+    last_seen: tuple[Any, ...] | None = None
+
+    def note_progress(b: Any) -> None:
+        nonlocal last_seen
+        counts = getattr(b, "request_counts", None)
+        completed = int(getattr(counts, "completed", 0) or 0)
+        failed = int(getattr(counts, "failed", 0) or 0)
+        total = int(getattr(counts, "total", 0) or 0)
+        seen = (b.status, completed, failed)
+        if seen == last_seen:
+            return
+        last_seen = seen
+        state["status"] = b.status
+        state["request_counts"] = {"completed": completed, "failed": failed, "total": total}
+        state_file.save(state)
+        logger.info(
+            "Batch %s: %s [%d/%d done, %d failed]",
+            batch_id, b.status, completed + failed, total, failed,
+        )
 
     deadline = time.monotonic() + poll_timeout
     batch = client.batches.retrieve(batch_id)
+    note_progress(batch)
     while batch.status not in TERMINAL_BATCH_STATUSES:
         if time.monotonic() > deadline:
             raise TimeoutError(
@@ -159,6 +202,7 @@ def run_batch_chunk(
             )
         time.sleep(poll_interval)
         batch = client.batches.retrieve(batch_id)
+        note_progress(batch)
 
     state["status"] = batch.status
     state["output_file_id"] = batch.output_file_id
@@ -250,10 +294,14 @@ def run_batch_or_sync(
     if use_batch:
         try:
             return run_batch(client, items, work_dir, tag, **batch_kwargs)
-        except Exception:
+        except Exception as exc:
             if mode == "batch":
                 raise
             # auto mode only: fall through to the sync path below.
+            logger.warning(
+                "Batch API path failed for tag=%s (%s: %s); falling back to "
+                "%d sync requests", tag, type(exc).__name__, exc, len(items),
+            )
 
     results: list[BatchItemResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

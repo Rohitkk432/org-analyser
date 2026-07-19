@@ -945,27 +945,84 @@ def run_module(
     timeout: int = 900,
     cwd: Path | None = None,
     extra_env: dict[str, str] | None = None,
+    stream_log_path: Path | None = None,
+    scrub_values: tuple[str, ...] = (),
 ) -> tuple[int, str, str]:
     """Run `python -m <module>` (resolves via cwd being on sys.path, no install required).
 
     Pass secrets through extra_env, never through args: argv is world-readable
     via `ps` and /proc/<pid>/cmdline.
+
+    stream_log_path switches from buffer-then-return to line-by-line
+    write-through: long phases (eval-kit, pr-task-profile) become `tail -f`-able
+    while they run instead of dumping output only after exit. Lines are
+    scrubbed of scrub_values before hitting disk, since this path bypasses the
+    scrub that record() applies to buffered detail. Return contract unchanged
+    either way: (returncode, stdout, stderr), stderr == "timeout" on timeout.
     """
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    try:
-        proc = subprocess.run(
-            [PYTHON_BIN, "-m", module, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return 1, "", "timeout"
-    return proc.returncode, proc.stdout or "", proc.stderr or ""
+    cmd = [PYTHON_BIN, "-m", module, *args]
+
+    if stream_log_path is None:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(cwd) if cwd else None,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return 1, "", "timeout"
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+    stream_log_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+    )
+    sink_lock = threading.Lock()
+    buffers: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    timed_out = False
+
+    with stream_log_path.open("w", encoding="utf-8") as sink:
+
+        def pump(pipe: Any, name: str) -> None:
+            for line in iter(pipe.readline, ""):
+                buffers[name].append(line)
+                with sink_lock:
+                    sink.write(scrub_secrets(line, *scrub_values))
+                    sink.flush()
+            pipe.close()
+
+        readers = [
+            threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True),
+            threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True),
+        ]
+        for t in readers:
+            t.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            proc.wait()
+        for t in readers:
+            t.join(timeout=10)
+        if timed_out:
+            with sink_lock:
+                sink.write(f"\n[org-analyser] killed after exceeding {timeout}s timeout\n")
+
+    if timed_out:
+        return 1, "".join(buffers["stdout"]), "timeout"
+    return proc.returncode, "".join(buffers["stdout"]), "".join(buffers["stderr"])
 
 
 def stdout_json(stdout: str) -> str:
@@ -1122,10 +1179,12 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         args.append("--skip-quality-llm")
         args.append("--skip-pr-rubrics")
     args.extend(["--pr-rubrics-provider", ctx.pr_rubrics_provider])
-    # Pipeline eval-kit runs use live chat.completions for taxonomy rather than
-    # the Batch API: each repo is a separate subprocess with its own timeout, so
-    # a 24h batch queue would stall the whole per-repo pool.
+    # Pipeline eval-kit runs use live chat.completions for taxonomy and
+    # PR-rubrics rather than the Batch API: each repo is a separate subprocess
+    # with its own timeout, so a 24h batch queue would stall the whole
+    # per-repo pool and guarantee a timeout kill.
     args.extend(["--taxonomy-llm-mode", "sync"])
+    args.extend(["--rubrics-llm-mode", "sync"])
 
     extra_env: dict[str, str] = {}
     if token:
@@ -1141,6 +1200,12 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         extra_env=extra_env or None,
         timeout=7200,
         cwd=CODING,
+        # The slowest, most opaque phase: stream its output live so a run on a
+        # 1000+-PR repo can be watched with `tail -f` instead of looking hung.
+        # (<phase>.log itself is overwritten with the summary by record() at
+        # the end, hence the separate .stream.log.)
+        stream_log_path=ctx.repo_log_dir(entry) / "eval-kit.stream.log",
+        scrub_values=tuple(t for t in (token,) if t),
     )
     if code != 0:
         return False, (out + err)[-2000:]
@@ -1233,6 +1298,63 @@ def run_quality_score(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tu
     return True, f"sealed -> {sealed_path}"
 
 
+def merged_pr_totals(merged_pr_dir: Path) -> dict[str, int]:
+    """repo full-name -> merged-PR count, from phase 1's CSVs. Used as the
+    denominator for eval-kit sub-progress (PRs scanned so far vs total).
+    Empty until merged-pr-counts has written its files (or local mode)."""
+    totals: dict[str, int] = {}
+    if not merged_pr_dir.is_dir():
+        return totals
+    for csv_path in merged_pr_dir.glob("*.csv"):
+        if csv_path.name == "summary.csv":
+            continue
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    repo = (row.get("repo") or "").strip()
+                    org = (row.get("org") or "").strip()
+                    if not repo:
+                        continue
+                    full = repo if "/" in repo else f"{org}/{repo}"
+                    try:
+                        totals[full] = int(row.get("merged_count") or 0)
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+    return totals
+
+
+def batch_state_summary(batch_state_dir: Path) -> str | None:
+    """One-line rollup of llm.batch's state sidecars for the progress UI.
+
+    The Batch API wait happens inside the pr-task-profile subprocess, which
+    the parent can't see into -- but llm.batch persists every stage/count
+    transition to *.state.json precisely so any process can reconstruct where
+    each batch stands. None when no sidecars exist (sync path or no LLM work).
+    """
+    states: list[dict[str, Any]] = []
+    if batch_state_dir.is_dir():
+        for p in sorted(batch_state_dir.glob("**/*.state.json")):
+            try:
+                states.append(json.loads(p.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+    if not states:
+        return None
+    by_status: dict[str, int] = {}
+    done = total = 0
+    for s in states:
+        by_status[s.get("status", "?")] = by_status.get(s.get("status", "?"), 0) + 1
+        counts = s.get("request_counts") or {}
+        done += counts.get("completed", 0) + counts.get("failed", 0)
+        total += counts.get("total", 0) or s.get("request_count", 0)
+    parts = ", ".join(f"{n} {status}" for status, n in sorted(by_status.items()))
+    if total:
+        return f"batch: {parts} [{done}/{total}]"
+    return f"batch: {parts}"
+
+
 def run_pr_task_profile(
     ctx: RunContext,
     log: PipelineLogger,
@@ -1241,19 +1363,19 @@ def run_pr_task_profile(
     log.info("Phase: PR task-profile report (rules + LLM)")
     ctx.task_profile_dir.mkdir(parents=True, exist_ok=True)
 
-    env = os.environ.copy()
+    extra_env: dict[str, str] = {}
     gh_token = ctx.tokens.get(ctx.github_token_name, "")
     gl_token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
     bb_token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
     bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "")
     if gh_token:
-        env["GITHUB_TOKEN"] = gh_token
+        extra_env["GITHUB_TOKEN"] = gh_token
     if gl_token:
-        env["GITLAB_TOKEN"] = gl_token
+        extra_env["GITLAB_TOKEN"] = gl_token
     if bb_token:
-        env["BITBUCKET_TOKEN"] = bb_token
+        extra_env["BITBUCKET_TOKEN"] = bb_token
     if bb_user:
-        env["BITBUCKET_USERNAME"] = bb_user
+        extra_env["BITBUCKET_USERNAME"] = bb_user
 
     args = [
         "--output-dir",
@@ -1301,23 +1423,26 @@ def run_pr_task_profile(
         for project in sorted(set(gitlab_projects)):
             args.extend(["--gitlab-project", project])
 
-    try:
-        proc = subprocess.run(
-            [PYTHON_BIN, "-m", "analysis.pr_task_profile", *args],
-            capture_output=True,
-            text=True,
-            timeout=86400,
-            env=env,
-            cwd=str(CODING),
-        )
-    except subprocess.TimeoutExpired:
+    code, out, err = run_module(
+        "analysis.pr_task_profile",
+        args,
+        timeout=86400,
+        cwd=CODING,
+        extra_env=extra_env or None,
+        # Runs last and can take hours on active orgs: stream output live so
+        # progress is `tail -f`-able. pr-task-profile.log still gets the final
+        # (truncated) copy below, preserving the existing behaviour.
+        stream_log_path=ctx.logs_dir / "pr-task-profile.stream.log",
+        scrub_values=tuple(t for t in (gh_token, gl_token, bb_token) if t),
+    )
+    if code != 0 and err == "timeout":
         log.phase_log(ctx.logs_dir / "pr-task-profile.log", "timeout after 24h")
         return {"ok": False, "error": "timeout"}
 
-    detail = (proc.stdout or "") + (proc.stderr or "")
+    detail = (out or "") + (err or "")
     log.phase_log(ctx.logs_dir / "pr-task-profile.log", detail[-50000:])
 
-    if proc.returncode != 0:
+    if code != 0:
         log.error(f"PR task-profile failed: {detail[-500:]}")
         return {"ok": False, "error": detail[-1000:]}
 
@@ -1390,9 +1515,10 @@ def process_repo(
     def emit_phase(phase: str, event: str) -> None:
         # event: "start" | "ok" | "failed" | "skip" (resume: already ok).
         # Feeds the rich progress UI's per-phase rows; a no-op under --quiet
-        # or non-TTY output (on_phase is None there).
+        # or non-TTY output (on_phase is None there). The repo name lets the
+        # UI track which repos a phase is mid-flight for (sub-progress).
         if on_phase is not None:
-            on_phase(phase, event)
+            on_phase(phase, event, entry.full_name)
 
     def phase_log_path(phase: str) -> str:
         return str(repo_log / f"{phase}.log")
@@ -1890,11 +2016,12 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--skip-f2p",
-        action="store_true",
-        default=bool(CONFIG.get("skip_f2p", False)),
+        action=argparse.BooleanOptionalAction,
+        default=bool(CONFIG.get("skip_f2p", True)),
         help="Skip F2P/P2P test verification in eval-kit (the slowest phase: it "
-        "installs deps and runs the test suite per accepted PR). Recommended "
-        "for large repos.",
+        "installs deps and runs the test suite 3x per accepted PR). Skipped by "
+        "default; pass --no-skip-f2p (or skip_f2p: false in config.yml) when the "
+        "output feeds a benchmark harness that needs execution-verified tasks.",
     )
     parser.add_argument(
         "--skip-pr-task-profile",
@@ -2174,15 +2301,82 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
             else:
                 if progress_ui:
                     progress_ui.start_org_phase("merged-pr-counts")
-                org_futures["merged-pr-counts"] = org_pool.submit(
+                fut = org_pool.submit(
                     run_org_phase, ctx, log, "merged-pr-counts", lambda: run_merged_pr_counts(ctx, log)
                 )
+                org_futures["merged-pr-counts"] = fut
+                if progress_ui:
+                    # Flip the row the moment the phase resolves -- the harvest
+                    # loop below only runs after the whole repo pool drains,
+                    # which left this row spinning as "running" long after the
+                    # work finished. Callback runs in the worker thread; rich
+                    # task updates are thread-safe, and the manifest write
+                    # stays in the harvest loop (re-finishing is idempotent).
+                    def _flip_merged_pr_counts(f: Any) -> None:
+                        exc = f.exception()
+                        result = None if exc else f.result()
+                        ok = exc is None and not (
+                            isinstance(result, dict) and result.get("ok") is False
+                        )
+                        progress_ui.finish_org_phase("merged-pr-counts", ok)
+
+                    fut.add_done_callback(_flip_merged_pr_counts)
             # pr-task-profile is NOT submitted here -- it runs last, after the
-            # repo pool and merged-pr-counts finish (see below).
+            # repo pool and merged-pr-counts finish (see below). Row appears
+            # immediately anyway so the phase isn't invisible until then.
+            if progress_ui and not ctx.skip_pr_task_profile:
+                progress_ui.queue_org_phase("pr-task-profile", "queued (runs last)")
             on_phase = progress_ui.update_phase if progress_ui else None
             repo_futures = {
                 repo_pool.submit(process_repo, e, ctx, log, on_phase): e for e in entries
             }
+
+            # eval-kit sub-progress: with few repos the phase bar's whole-repo
+            # granularity reads as "stuck at 0%" for the longest phase. The
+            # subprocess streams one "Processing PR #..." line per PR, and
+            # phase 1's CSVs give the denominator, so a watcher can move the
+            # bar fractionally through the phase.
+            stop_eval_watch = threading.Event()
+            eval_watch: threading.Thread | None = None
+            if progress_ui:
+                entries_by_name = {e.full_name: e for e in entries}
+
+                def _watch_eval_kit() -> None:
+                    totals: dict[str, int] = {}
+                    while not stop_eval_watch.wait(5.0):
+                        if not totals:
+                            totals = merged_pr_totals(ctx.merged_pr_dir)
+                        running = progress_ui.phase_running("eval-kit")
+                        if not running:
+                            continue
+                        scanned_sum, total_sum, frac_sum = 0, 0, 0.0
+                        for name in running:
+                            entry = entries_by_name.get(name)
+                            if entry is None:
+                                continue
+                            stream = ctx.repo_log_dir(entry) / "eval-kit.stream.log"
+                            try:
+                                text = stream.read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                continue
+                            scanned = text.count("Processing PR #")
+                            scanned_sum += scanned
+                            total = totals.get(name, 0)
+                            if total:
+                                total_sum += total
+                                frac_sum += min(scanned / total, 0.99)
+                        if not scanned_sum:
+                            continue
+                        detail = (
+                            f"[{scanned_sum}/{total_sum} PRs]"
+                            if total_sum
+                            else f"[~{scanned_sum} PRs]"
+                        )
+                        progress_ui.note_phase_progress("eval-kit", frac_sum, detail)
+
+                eval_watch = threading.Thread(target=_watch_eval_kit, daemon=True)
+                eval_watch.start()
+
             for i, fut in enumerate(as_completed(repo_futures), 1):
                 entry = repo_futures[fut]
                 try:
@@ -2204,6 +2398,10 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                 elif i % 5 == 0 or i == len(entries):
                     log.info(f"  Progress {i}/{len(entries)} ({ok_count} fully ok)")
 
+            stop_eval_watch.set()
+            if eval_watch is not None:
+                eval_watch.join(timeout=2)
+
             for name, fut in org_futures.items():
                 result = fut.result()
                 ctx.manifest["phases"][name] = result
@@ -2223,9 +2421,31 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
             else:
                 if progress_ui:
                     progress_ui.start_org_phase("pr-task-profile")
-                task_result = run_org_phase(
-                    ctx, log, "pr-task-profile", lambda: run_pr_task_profile(ctx, log, entries)
-                )
+                stop_watch = threading.Event()
+                watch_thread: threading.Thread | None = None
+                if progress_ui:
+                    # Surface the subprocess's Batch API stages on this row
+                    # ("batch: 1 in_progress [120/500]") by polling the state
+                    # sidecars llm.batch writes on every transition -- without
+                    # this, a multi-hour batch wait is a bare spinner.
+                    def _watch_batches() -> None:
+                        while not stop_watch.wait(5.0):
+                            summary = batch_state_summary(ctx.task_profile_dir / "batch_state")
+                            if summary:
+                                progress_ui.note_org_phase(
+                                    "pr-task-profile", f"running ({summary})"
+                                )
+
+                    watch_thread = threading.Thread(target=_watch_batches, daemon=True)
+                    watch_thread.start()
+                try:
+                    task_result = run_org_phase(
+                        ctx, log, "pr-task-profile", lambda: run_pr_task_profile(ctx, log, entries)
+                    )
+                finally:
+                    stop_watch.set()
+                    if watch_thread is not None:
+                        watch_thread.join(timeout=2)
                 ctx.manifest["phases"]["pr-task-profile"] = task_result
                 if progress_ui:
                     ok = not (isinstance(task_result, dict) and task_result.get("ok") is False)

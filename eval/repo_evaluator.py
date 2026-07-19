@@ -2935,6 +2935,7 @@ class RepoEvaluator:
         skip_pr_rubrics: bool = False,
         pr_rubrics_provider: str = "openai",
         rubrics_batch_work_dir: Optional[Path] = None,
+        rubrics_llm_mode: str = "auto",
     ):
         self.repo_path = repo_path
         self.owner = owner
@@ -2954,6 +2955,7 @@ class RepoEvaluator:
         self.skip_pr_rubrics = skip_pr_rubrics
         self.pr_rubrics_provider = pr_rubrics_provider
         self.rubrics_batch_work_dir = rubrics_batch_work_dir
+        self.rubrics_llm_mode = rubrics_llm_mode
 
     def evaluate(self) -> AnalysisReport:
         if not self.platform_client:
@@ -3360,6 +3362,7 @@ class RepoEvaluator:
                     candidates,
                     batch_work_dir=self.rubrics_batch_work_dir,
                     tag=f"{self.owner}_{self.repo_name}",
+                    llm_mode=self.rubrics_llm_mode,
                 )
             except Exception as e:
                 logger.warning(
@@ -4112,6 +4115,14 @@ def main():
         "(concurrent), 'batch' = OpenAI Batch API, 'auto' = batch once PR count "
         ">= threshold (default: auto).",
     )
+    parser.add_argument(
+        "--rubrics-llm-mode",
+        choices=("auto", "batch", "sync"),
+        default="auto",
+        help="PR-rubrics scoring path: 'sync' = live chat.completions per PR "
+        "(concurrent), 'batch' = OpenAI Batch API, 'auto' = batch once accepted-PR "
+        "count >= threshold (default: auto).",
+    )
 
     args = parser.parse_args()
 
@@ -4231,6 +4242,7 @@ def main():
                 if args.output
                 else None
             ),
+            rubrics_llm_mode=args.rubrics_llm_mode,
         )
 
         report = evaluator.evaluate()
