@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 try:
     from .credential_redactor import redact_secrets
-except ImportError:  # invoked as a top-level script (cwd=repo-eval-kit)
+except ImportError:  # invoked as a top-level script (cwd=eval)
     from credential_redactor import redact_secrets
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)

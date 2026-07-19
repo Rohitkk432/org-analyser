@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 
 try:
     from .credential_redactor import redact_diff, redact_secrets, redaction_summary
-except ImportError:  # invoked as a top-level script (cwd=repo-eval-kit)
+except ImportError:  # invoked as a top-level script (cwd=eval)
     from credential_redactor import redact_diff, redact_secrets, redaction_summary
 
 logger = logging.getLogger(__name__)
