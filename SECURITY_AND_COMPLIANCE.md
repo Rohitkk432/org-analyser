@@ -10,7 +10,7 @@
 
 ## 1. What the system does, and its trust model
 
-`run_org_pipeline.py` orchestrates six phases against a GitHub org, GitLab group, or explicit repo list. For each repo it clones the source, runs static profilers, calls LLMs to classify and score, and writes a zipped report bundle to `outputs/org-pipeline-runs/`.
+`cli.py` (the `org-analyser` command) orchestrates six phases against a GitHub org, GitLab group, Bitbucket workspace, or explicit repo list. For each repo it clones the source, runs static profilers, calls LLMs to classify and score, and writes a zipped report bundle to `outputs/org-analyser-runs/`.
 
 Three properties follow from that shape, and they define the whole threat model:
 
@@ -28,10 +28,10 @@ Controls in §4 map one-to-one onto these three.
 
 | Data                                                   | Captured by                                                         | Stored where                                          | Retained                                              |
 | ------------------------------------------------------ | ------------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------- |
-| Full repository clone (all files, full git history)    | `fresh_clone` ([run_org_pipeline.py](run_org_pipeline.py#L580))    | `outputs/.../clones/` or `~/org-pipeline-clones/` | **Deleted after every run** (`remove_clones`) |
-| Code samples, file paths, LOC, duplication, complexity | codebase_profiler, repo_analyzer                                    | Run bundle (XLSX/CSV/JSON)                            | Retention window (§4.5)                              |
-| Git diffs / patches                                    | repo-eval-kit                                                       | Sent to LLM; scores persisted                         | Scores only                                           |
-| Secrets detected in scanned code                       | `scan_secrets_and_pii` ([repo_analyzer.py](repo_analyzer.py#L517)) | Run bundle,**masked** as `[REDACTED]`         | Masked only — the value is never written             |
+| Full repository clone (all files, full git history)    | `fresh_clone` ([cli.py](cli.py#L718))    | `outputs/.../clones/` or `~/org-analyser-clones/` | **Deleted after every run** (`remove_clones`) |
+| Code samples, file paths, LOC, duplication, complexity | profiler, analysis/repo_analyzer.py                                    | Run bundle (XLSX/CSV/JSON)                            | Retention window (§4.5)                              |
+| Git diffs / patches                                    | eval/                                                       | Sent to LLM; scores persisted                         | Scores only                                           |
+| Secrets detected in scanned code                       | `scan_secrets_and_pii` ([analysis/repo_analyzer.py](analysis/repo_analyzer.py#L516)) | Run bundle,**masked** as `[REDACTED]`         | Masked only — the value is never written             |
 
 ### 2.2 Personal data
 
@@ -67,7 +67,7 @@ Both providers are **processors** in GDPR terms and belong in a Record of Proces
 Two provider-level facts that redaction cannot address, because they are about the contract, not the payload:
 
 - **OpenAI API** does not train on API data by default, but retains it up to 30 days for abuse monitoring unless you hold a Zero Data Retention agreement.
-- **Google Gemini** — on the **free/unpaid tier**, Google *does* use submitted content to improve its products. If the key configured in [quality_evaluator.py](repo-eval-kit/quality_evaluator.py#L625) is free-tier, your source code is going into Google's training data. **This is the single highest-consequence open question in the system** (§7).
+- **Google Gemini** — on the **free/unpaid tier**, Google *does* use submitted content to improve its products. If the key configured in [quality_evaluator.py](eval/quality_evaluator.py#L449) is free-tier, your source code is going into Google's training data. **This is the single highest-consequence open question in the system** (§7).
 
 ---
 
@@ -79,9 +79,9 @@ Each control is stated as the guarantee it provides, where it is enforced, and h
 
 The F2P/P2P analysis runs the target repo's own build and test commands — `make`, `pytest`, `npm`, `gradle`, `dotnet` — inside the clone. That is arbitrary code execution by design, and it is the price of the feature.
 
-**Guarantee:** that code runs with a **default-deny environment**. `build_child_env()` ([test_runners/base.py](repo-eval-kit/test_runners/base.py#L14)) constructs the child env from an allowlist — `PATH`, `HOME`, locale, temp dirs, Windows essentials, toolchain roots (`JAVA_HOME`, `GOPATH`, `CARGO_HOME`, …). Everything else is dropped, including every credential the pipeline holds.
+**Guarantee:** that code runs with a **default-deny environment**. `build_child_env()` ([eval/test_runners/base.py](eval/test_runners/base.py#L45)) constructs the child env from an allowlist — `PATH`, `HOME`, locale, temp dirs, Windows essentials, toolchain roots (`JAVA_HOME`, `GOPATH`, `CARGO_HOME`, …). Everything else is dropped, including every credential the pipeline holds.
 
-**Why it holds:** `_run_command` is the single choke point every test runner routes through. There is no second path — `analyzer.py`'s other subprocess calls are all plain `git`, and the one caller passing a custom env passes an overrides dict, not a fresh `os.environ.copy()`.
+**Why it holds:** `_run_command` is the single choke point every test runner routes through. There is no second path — `eval/test_runners/analyzer.py`'s other subprocess calls are all plain `git`, and the one caller passing a custom env passes an overrides dict, not a fresh `os.environ.copy()`.
 
 **Check:** `python test_env_scrub.py` — seeds five fake credentials, spawns a child that dumps its own environment, asserts none survive.
 
@@ -91,7 +91,7 @@ The F2P/P2P analysis runs the target repo's own build and test commands — `mak
 
 ### 4.2 Secrets cannot reach an LLM provider
 
-**Guarantee:** every OpenAI client in the repo is constructed by [`llm_safety.safe_openai()`](repo-eval-kit/llm_safety.py), which returns a guarded client that redacts `messages` (and Responses-API `input`) **on the way out**. Redaction is a property of the client, not a step a call site has to remember.
+**Guarantee:** every OpenAI client in the repo is constructed by [`llm_safety.safe_openai()`](eval/llm_safety.py#L120), which returns a guarded client that redacts `messages` (and Responses-API `input`) **on the way out**. Redaction is a property of the client, not a step a call site has to remember.
 
 **Why it holds:** redaction used to be opt-in per call site, and was wired into only four of seven — which is precisely how raw git diffs, PR bodies, and human review comments came to be shipped unredacted. Moving it into the client removes the failure mode rather than patching its instances.
 
@@ -119,7 +119,7 @@ No `eval`, `exec`, `pickle.load`, or unsafe `yaml.load` anywhere in the tree (ve
 
 ### 4.6 Committer emails do not reach the deliverable
 
-Emails are read from git history, used for bot detection, and then replaced at emission with a stable pseudonym (`author_id: anon:…`, [git_stats.py](repo-quality-score/scripts/git_stats.py)).
+Emails are read from git history, used for bot detection, and then replaced at emission with a stable pseudonym (`author_id: anon:…`, [git_stats.py](quality/scripts/git_stats.py#L176)).
 
 **Zero quality cost, and this is worth being precise about:** bot detection already runs against the *real* address and stores its verdict as `is_bot`, and nothing downstream ever read the address itself. The hash is stable, so authors can still be deduplicated and joined across repos and runs. Nothing that consumed this data lost anything.
 
@@ -156,22 +156,22 @@ Under the owner-run model, the surviving compliance obligations are operational,
 - **Prompt injection is unmitigated.** Untrusted repository content flows into LLM prompts whose outputs drive scoring. A repository can embed instructions to inflate its own score or suppress a finding. Bounded by §4.4 — it cannot reach code execution — and under the owner-run model the incentive to attack your own score is low. Treat scores from unreviewed repos as advisory.
 - **Redaction is pattern-based** (§4.2) and will not catch every bespoke secret format.
 - **Test code runs on the host**, not in a container (§4.1).
-- **`shell=True`** at [bulk_repo_evaluator_parallel.py:320](repo-eval-kit/bulk_repo_evaluator_parallel.py#L320) — fed internally-constructed commands today, but a shell-injection primitive waiting for a future caller.
-- **No dependency vulnerability scanning.** `requirements.txt` pins only lower bounds. `pip-audit` in CI would close this.
+- **`shell=True`** at [bulk_repo_evaluator_parallel.py:320](eval/bulk_repo_evaluator_parallel.py#L320) — fed internally-constructed commands today, but a shell-injection primitive waiting for a future caller.
+- **No dependency vulnerability scanning.** `pyproject.toml` pins only lower bounds. `pip-audit` in CI would close this.
 
 ---
 
 ## 7. Open items — operator decisions
 
 1. **Confirm the Gemini API key's tier.** If it is free-tier, Google uses your source code for model training (§3). Not a code change, and the highest-consequence unknown in the system.
-2. **Historical run bundles predate the email fix.** Bundles already in `outputs/org-pipeline-runs/` still contain real committer addresses — §4.6 applies to new runs only. Purge them or re-run.
+2. **Historical run bundles predate the email fix.** Bundles already in `outputs/org-analyser-runs/` still contain real committer addresses — §4.6 applies to new runs only. Purge them or re-run.
 
 ---
 
 ## 8. Verification
 
 ```console
-$ cd repo-eval-kit
+$ cd eval
 
 $ python test_env_scrub.py
 OK: repo commands run credential-free

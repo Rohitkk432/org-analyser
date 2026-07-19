@@ -1,158 +1,96 @@
-# Org Pipeline
+# org-analyser
 
-Runnable package for the org/repo analysis pipeline.
+Org/repo codebase analysis pipeline: merged-PR counts, PR task-profile, codebase
+profiler, eval-kit, and sealed repo quality score — one command, one or many
+repos, across GitHub, GitLab, Bitbucket, or a folder of local checkouts.
 
-This repo contains the master orchestrator plus the local subprojects it calls during a full run:
+This repo is an installable package (`pyproject.toml`) with these subpackages:
 
-- `codebase_profiler/`
-- `repo_analyzer.py` — LLM-usage detection, training-data-quality scoring, CI/test analysis
-- `repo-eval-kit/`
-- `repo-quality-score/`
-- helper scripts for merged PR counts and PR task-profile classification
-
-## What It Runs
-
-`run_org_pipeline.py` runs these phases:
-
-1. Merged PR/MR counts
-2. PR task-profile report
-3. Codebase profiler vendor sheet
-4. Repo analyzer — LLM-usage, training-data-quality, and CI/test report per repo
-5. Data eval-kit repository evaluation
-6. Sealed repo quality score and org rollup
-
-Use `run_org_pipeline_no_quality.py` when you want to skip the sealed repo-quality-score stage.
+- `analysis/` — merged-PR counts, PR task-profile classification, vendor-CSV repo analyzer
+- `profiler/` — the codebase intake-sheet profiler (`codebase-profiler`)
+- `eval/` — full LLM-backed repo evaluation ("eval-kit")
+- `quality/` — sealed, tamper-evident repo quality score
+- `mirror/` — GitHub org / GitLab group replication (copy-only, source never modified)
 
 ## System Dependencies
 
-Install these before running the pipeline:
-
-- Python 3.10+
-- `git`
-- `scc` for lines-of-code metrics in `codebase_profiler`
-- Node.js / `npx` for duplication metrics in `codebase_profiler`
-
-macOS:
+Python 3.10+, `git`, `scc` (LOC metrics), Node.js/`npx` (duplication metrics via `jscpd`).
 
 ```bash
-brew install git scc node
+brew install git scc node                    # macOS
+choco install git nodejs scc -y               # Windows (Chocolatey)
+sudo apt-get install -y git nodejs npm        # Ubuntu/Debian — get scc from its releases page
 ```
 
-Windows with Chocolatey:
+If `scc` isn't packaged for your platform, grab the binary from its
+[releases page](https://github.com/boyter/scc/releases/latest) and put it on `PATH`.
 
-```powershell
-choco install git nodejs scc -y
-```
-
-If Chocolatey fails for `scc`, download the Windows binary directly from the
-[`scc` releases page](https://github.com/boyter/scc/releases/latest), extract
-`scc.exe`, and put it on your `PATH`.
-
-Ubuntu/Debian:
+## Setup
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git nodejs npm
-# Install scc from https://github.com/boyter/scc/releases/latest
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip   # need pip>=21.3 for editable installs (PEP 660)
+pip install -e .
+cp config.example.yml config.yml
 ```
 
-Verify:
-
-```bash
-git --version
-scc --version
-node --version
-npx --version
-```
-
-## Python Setup
-
-```bash
-python3.12 -m venv .venv  # or python3.11 / python3.10
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-python --version            # must be 3.10+
-python -m pip install --upgrade pip setuptools wheel hatchling
-python -m pip install -r requirements.txt
-python -m pip install -e ./codebase_profiler
-export ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python"
-```
-
-If your shell already shows another venv, such as `(env)`, run `deactivate`
-first. `codebase_profiler` requires Python 3.10+, so a Python 3.9 venv will fail
-even if package installation starts successfully.
-
-`ORG_PIPELINE_PYTHON` is important: the master script launches helper scripts in
-subprocesses, and this forces them to use the same venv where `requests`,
-`openai`, `openpyxl`, and other dependencies were installed.
-
-If `pip install -e ./codebase_profiler` fails with `setup.py or setup.cfg not found`,
-your `pip` is too old for editable installs from `pyproject.toml`. Run:
-
-```bash
-python -m pip install --upgrade pip hatchling
-python -m pip install -e ./codebase_profiler
-```
+If your shell already shows another venv, run `deactivate` first — this
+package requires Python 3.10+, and an older venv will fail even if
+installation appears to start successfully.
 
 ## Tokens
 
-Copy `tokens.example` to `tokens` and fill in the values:
+Edit `config.yml` → fill in `tokens:` (only whichever platform(s) you use).
+`config.yml` is gitignored, never committed. Pass `--tokens-file` instead if
+you'd rather keep tokens in a separate key=value file.
 
-```ini
-github-data-token=...
-gitlab_token=...
-openai_key=...
-```
+- `github-data-token` — [github.com/settings/tokens](https://github.com/settings/tokens) (classic, `repo` scope)
+- `gitlab_token` — [gitlab.com/-/user_settings/personal_access_tokens](https://gitlab.com/-/user_settings/personal_access_tokens) (`read_api` scope)
+- `bitbucket_token` / `bitbucket_username` — Bitbucket app password, workspace/repo access token, or Atlassian API token (see `profiler/README.md` → Authentication for the token-type-to-env-var mapping); optional for public repos
+- `openai_key` — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (or set `OPENAI_API_KEY`/`AZURE_OPENAI_*` in the environment)
 
-Do not commit real tokens. `tokens` is ignored by git.
+Do not commit real tokens.
 
 ## Run Examples
 
-GitHub org:
-
 ```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline.py --github-org <ORG_NAME> --tokens-file tokens --workers 10
+org-analyser --github-org <ORG_NAME> --workers 10               # whole GitHub org
+org-analyser --github-repo <OWNER>/<REPO> --workers 1            # single GitHub repo
+org-analyser --gitlab-group <GROUP_NAME> --workers 10            # whole GitLab group
+org-analyser --gitlab-project <GROUP>/<PROJECT> --workers 1      # single GitLab project
+org-analyser --bitbucket-workspace <WORKSPACE_NAME> --workers 10 # whole Bitbucket workspace
+org-analyser --bitbucket-repo <WORKSPACE>/<REPO> --workers 1     # single Bitbucket repo
+org-analyser --local-repos-dir ./repos --workers 4               # local checkouts
+org-analyser --github-org <ORG_NAME> --skip-quality-score        # skip the sealed quality-score phase
 ```
 
-Single GitHub repo:
-
-```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline.py --github-repo <OWNER>/<REPO> --tokens-file tokens --workers 1
-```
-
-GitLab group:
-
-```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline.py --gitlab-group <GROUP_NAME> --tokens-file tokens --workers 10
-```
-
-Single GitLab project:
-
-```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline.py --gitlab-project <GROUP>/<PROJECT> --tokens-file tokens --workers 1
-```
-
-Local repos folder:
-
-```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline.py --local-repos-dir ./repos --repos-manifest repos-manifest.example.json --tokens-file tokens --workers 4
-```
-
-No-quality variant:
-
-```bash
-ORG_PIPELINE_PYTHON="$(pwd)/.venv/bin/python" python run_org_pipeline_no_quality.py --github-org <ORG_NAME> --tokens-file tokens --workers 10
-```
+Any flag can instead be set as a default in `config.yml` — with a target and
+tokens filled in there, `org-analyser` runs with zero flags. `org-analyser --help`
+lists every flag.
 
 ## Outputs
 
 Runs are written under:
 
 ```text
-outputs/org-pipeline-runs/
+outputs/org-analyser-runs/
 ```
 
-Each run produces a timestamped folder, logs, CSV/JSON/XLSX outputs, and a zip archive.
+Each run produces a timestamped folder, logs, CSV/JSON/XLSX outputs, and a zip
+archive. Run bundles carry contributor names, per-author stats, and scores;
+old bundles are pruned automatically after `--retention-days` (default 90).
+
+## Debug
+
+- **`SSL: CERTIFICATE_VERIFY_FAILED`** — fixed via `certifi`; rerun after `pip install -e .` picks up the dependency.
+- **Auth / 404 / "Could not resolve to a Repository"** — check the token in `config.yml` has access to that org/repo, and the `owner/repo` (or `workspace/repo`) name is correct.
+- **Config not picked up** — confirm you're running from the repo root (`config.yml` must sit next to `cli.py`), or set `ORG_ANALYSER_CONFIG=/path/to/config.yml`.
+- **No target error** — pass one of `--github-org` / `--github-repo` / `--gitlab-group` / `--gitlab-project` / `--bitbucket-workspace` / `--bitbucket-repo` / `--local-repos-dir`, or set one under `config.yml`.
+- Logs print to stdout during the run; check the run's `manifest.json` for a per-repo pass/fail summary.
 
 ## More Docs
 
-See `ORG_PIPELINE_README.md` for the full pipeline documentation and `PR_TASK_PROFILE_README.md` for PR classification details.
+See `ORG_PIPELINE_README.md` for the full pipeline documentation,
+`PR_TASK_PROFILE_README.md` for PR classification details, and
+`SECURITY_AND_COMPLIANCE.md` for the credential-handling and redaction model.
