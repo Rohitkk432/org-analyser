@@ -1,202 +1,59 @@
 # repo-mirror
 
-Tools for **full-fidelity replication** of code hosting into copies you own.
+Full-fidelity, copy-only replication of code hosting into copies you own. The
+source org/group is never modified or deleted; re-runs resume from state and
+skip anything already marked `success`.
 
 | Script | Platform | Method |
 |--------|----------|--------|
 | `replicate_github_org.sh` | GitHub org | [GitHub Enterprise Importer (GEI)](https://docs.github.com/en/migrations/using-github-enterprise-importer) |
 | `repo_mirror.py` | GitLab group | Project export → import |
 
-Both scripts are **copy-only**: the source org/group is never modified or deleted. Re-runs are safe and resume from per-project/per-repo state.
+Tokens come from `config.yml`'s `tokens:` mapping (`github-data-token` /
+`gitlab_token`) or `--tokens-file` / `--token` directly — see the root `README.md`.
 
----
+## GitHub org replication
 
-## Setup
+Migrates repos (incl. archived/forks), branches/tags/commits, issues, PRs +
+reviews, labels/milestones/releases, wikis, and LFS objects. Does **not**
+migrate: Actions run history/secrets, stars/traffic stats, webhooks/deploy
+keys, packages, org SSO/billing/team membership — handle those manually.
 
-Uses the same `tokens` file as the rest of the repo (repo root, `github-data-token`
-/ `gitlab_token` keys — see the root `README.md`). From the repo root:
-
-```bash
-cp tokens.example tokens   # if you haven't already — add your tokens, never commit it
-```
-
----
-
-# GitHub org replication
-
-`replicate_github_org.sh` copies every repository from a source GitHub org into a target org.
-
-## What gets migrated
-
-- All repositories (including archived and forks)
-- Branches, tags, commits
-- Issues, pull requests, reviews, review comments
-- Labels, milestones, releases
-- Wikis and attachments (where GEI supports them)
-- Git LFS objects (second pass)
-
-## What does NOT migrate (manual follow-up)
-
-- Actions run history (workflows migrate; past runs do not)
-- Actions secrets/variables
-- Stars, fork counts, traffic stats
-- Deploy keys, webhooks, GitHub Apps
-- GitHub Packages / container images
-- Org SSO, billing, team membership
-
-## Prerequisites
-
-- [GitHub CLI](https://cli.github.com/) (`gh`)
-- `git`, `git-lfs`, `jq`, `curl`
-- GEI extension: `gh extension install github/gh-gei`
-- **Target org must already exist** (e.g. `VendorOrg-mirror`)
-- PAT with access to **both** source and target orgs (org owner or GEI role)
-
-Required token scopes: `repo`, `read:org`, `workflow` (and GEI permissions on both orgs).
-
-## Usage
-
-Run from the repo root:
+Prerequisites: [`gh`](https://cli.github.com/) + `gh extension install github/gh-gei`,
+`git`/`git-lfs`/`jq`/`curl`, the target org already created, and a PAT with
+`repo`/`read:org`/`workflow` scopes plus GEI access on both orgs.
 
 ```bash
-./repo_pipeline/mirror/replicate_github_org.sh \
-  --tokens-file tokens \
-  --source-org SOURCE_ORG \
-  --target-org SOURCE_ORG-mirror
-```
-
-Or pass the token directly:
-
-```bash
-./repo_pipeline/mirror/replicate_github_org.sh \
-  --token ghp_... \
-  --source-org SOURCE_ORG \
-  --target-org SOURCE_ORG-mirror
-```
-
-Token key in `tokens`: `github-data-token=ghp_...`
-
-## Output
-
-```
-org-replica-<source>-to-<target>/
-├── logs/
-├── state/
-├── repos.txt
-├── migration-report.csv
-├── migration-report.json
-└── POST_MIGRATION_CHECKLIST.md
-```
-
-## Example
-
-```bash
-./repo_pipeline/mirror/replicate_github_org.sh \
+./mirror/replicate_github_org.sh \
   --tokens-file tokens \
   --source-org acme-corp \
   --target-org acme-corp-mirror
 ```
 
----
+Output: `org-replica-<source>-to-<target>/` with `logs/`, `state/`, a
+migration report (csv/json), and `POST_MIGRATION_CHECKLIST.md`.
 
-# GitLab group replication
+## GitLab group replication
 
-`repo_mirror.py` copies every project from a source GitLab group into a target group on the same GitLab host.
+Migrates projects (incl. archived, subgroups), the git repo, issues, MRs +
+comments, labels/milestones/snippets, wiki/uploads, LFS. Does **not**
+migrate: CI/CD variables, pipeline history, registries, webhooks/runners,
+group-level permissions/SAML.
 
-## What gets migrated
-
-- All projects (including archived, including subgroups)
-- Git repository (branches, tags, commits)
-- Issues and issue comments
-- Merge requests and MR comments
-- Labels, milestones, snippets
-- Wiki and uploads (within GitLab export limits)
-- Git LFS objects (when included in export)
-
-## What does NOT migrate (manual follow-up)
-
-- CI/CD variables and secrets
-- Pipeline run history
-- Container registry and package registry
-- Webhooks, deploy keys, runners
-- Group-level permissions and SAML settings
-
-## Prerequisites
-
-- Python 3.10+ (stdlib only — no pip dependencies)
-- **Target top-level group must already exist** in GitLab UI
-- Token with **Maintainer+** on source projects and target group (`api` scope)
-
-## Usage
-
-After `pip install -e .` (repo root), the `repo-mirror` console script is on your PATH:
-
-```bash
-repo-mirror \
-  --tokens-file tokens \
-  --source-group source-group \
-  --target-group source-group-mirror
-```
-
-Or run from source without installing:
-
-```bash
-python -m repo_pipeline.mirror.repo_mirror \
-  --tokens-file tokens \
-  --source-group source-group \
-  --target-group source-group-mirror
-```
-
-Or pass the token directly:
-
-```bash
-repo-mirror \
-  --token glpat-... \
-  --source-group my-group \
-  --target-group my-group-mirror \
-  --gitlab-host gitlab.com
-```
-
-Token key in `tokens`: `gitlab_token`.
-
-### Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--gitlab-host` | `gitlab.com` | GitLab hostname or base URL |
-| `--workdir` | `./group-replica-<source>-to-<target>` | Stable work directory |
-| `--poll-seconds` | `15` | Export/import poll interval |
-| `--export-timeout` | `7200` | Per-project export timeout (seconds) |
-| `--import-timeout` | `7200` | Per-project import timeout (seconds) |
-
-## Output
-
-```
-group-replica-<source>-to-<target>/
-├── logs/
-├── state/
-├── exports/
-├── projects.txt
-├── migration-report.csv
-├── migration-report.json
-└── POST_MIGRATION_CHECKLIST.md
-```
-
-Subgroups under the target are created automatically when needed.
-
-## Example
+Prerequisites: Python 3.10+ (stdlib only), the target top-level group already
+created in the GitLab UI, and a token with Maintainer+ / `api` scope on both.
 
 ```bash
 repo-mirror \
   --tokens-file tokens \
   --source-group example-group \
-  --target-group example-group-mirror
+  --target-group example-group-mirror \
+  --gitlab-host gitlab.com   # default; omit for gitlab.com
 ```
 
----
+Options: `--workdir` (default `./group-replica-<source>-to-<target>`),
+`--poll-seconds` (15), `--export-timeout` / `--import-timeout` (7200s each).
 
-## Notes (both platforms)
-
-- Large orgs/groups can take many hours
-- Re-running skips projects/repos already marked `success`
-- Never commit `tokens` — it is listed in `.gitignore`
+Output: `group-replica-<source>-to-<target>/` with `logs/`, `state/`,
+`exports/`, a migration report (csv/json), and `POST_MIGRATION_CHECKLIST.md`.
+Target subgroups are created automatically as needed.

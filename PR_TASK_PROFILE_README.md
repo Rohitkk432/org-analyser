@@ -23,38 +23,10 @@ the unified `org-analyser` CLI, which calls this module directly).
 | `other` | Does not cleanly fit the above. |
 | `automated` | Bot-authored PRs (Dependabot, Renovate, etc.). |
 
----
-
-## Requirements
-
-- Python 3.9+
-- Dependencies:
-
-```bash
-pip install requests openai python-dotenv
-```
-
----
-
-## Setup
-
-Set credentials as environment variables or in a `.env` file (loaded automatically):
-
-```dotenv
-GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx          # only for GitLab targets
-BITBUCKET_TOKEN=xxxxxxxxxxxxxxxxxxxx              # only for Bitbucket targets; omit for public repos
-BITBUCKET_USERNAME=your-bitbucket-username        # app passwords / Atlassian API token email only
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-| Variable | Required | Notes |
-|----------|----------|-------|
-| `GITHUB_TOKEN` | GitHub targets | Read access to target repos. |
-| `GITLAB_TOKEN` | GitLab targets | Read access to target groups/projects. |
-| `BITBUCKET_TOKEN` | Bitbucket targets | Optional for public repos (anonymous, lower rate limit). See `profiler/README.md` → Authentication for the token-type-to-username mapping. |
-| `BITBUCKET_USERNAME` | Bitbucket app passwords / Atlassian API tokens | Leave unset for a workspace/repo access token. |
-| `OPENAI_API_KEY` | Always, unless Azure is configured | LLM pass is mandatory; `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY` work instead. |
+Setup, tokens, and dependencies: see the root [`README.md`](./README.md). Needs
+whichever of `GITHUB_TOKEN`/`GITLAB_TOKEN`/`BITBUCKET_TOKEN`(+`BITBUCKET_USERNAME`)
+your targets require, plus an LLM credential (`OPENAI_API_KEY` or Azure) — the LLM
+pass is mandatory.
 
 ---
 

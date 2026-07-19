@@ -14,45 +14,16 @@ This repo is an installable package (`pyproject.toml`) with these subpackages:
 
 ## System Dependencies
 
-Install these before running the pipeline:
-
-- Python 3.10+
-- `git`
-- `scc` for lines-of-code metrics (`profiler/`)
-- Node.js / `npx` for duplication metrics (`profiler/`)
-
-macOS:
+Python 3.10+, `git`, `scc` (LOC metrics), Node.js/`npx` (duplication metrics via `jscpd`).
 
 ```bash
-brew install git scc node
+brew install git scc node                    # macOS
+choco install git nodejs scc -y               # Windows (Chocolatey)
+sudo apt-get install -y git nodejs npm        # Ubuntu/Debian — get scc from its releases page
 ```
 
-Windows with Chocolatey:
-
-```powershell
-choco install git nodejs scc -y
-```
-
-If Chocolatey fails for `scc`, download the Windows binary directly from the
-[`scc` releases page](https://github.com/boyter/scc/releases/latest), extract
-`scc.exe`, and put it on your `PATH`.
-
-Ubuntu/Debian:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git nodejs npm
-# Install scc from https://github.com/boyter/scc/releases/latest
-```
-
-Verify:
-
-```bash
-git --version
-scc --version
-node --version
-npx --version
-```
+If `scc` isn't packaged for your platform, grab the binary from its
+[releases page](https://github.com/boyter/scc/releases/latest) and put it on `PATH`.
 
 ## Setup
 
@@ -83,52 +54,15 @@ Do not commit real tokens.
 
 ## Run Examples
 
-GitHub org:
-
 ```bash
-org-analyser --github-org <ORG_NAME> --workers 10
-```
-
-Single GitHub repo:
-
-```bash
-org-analyser --github-repo <OWNER>/<REPO> --workers 1
-```
-
-GitLab group:
-
-```bash
-org-analyser --gitlab-group <GROUP_NAME> --workers 10
-```
-
-Single GitLab project:
-
-```bash
-org-analyser --gitlab-project <GROUP>/<PROJECT> --workers 1
-```
-
-Bitbucket workspace:
-
-```bash
-org-analyser --bitbucket-workspace <WORKSPACE_NAME> --workers 10
-```
-
-Single Bitbucket repo:
-
-```bash
-org-analyser --bitbucket-repo <WORKSPACE>/<REPO> --workers 1
-```
-
-Local repos folder:
-
-```bash
-org-analyser --local-repos-dir ./repos --repos-manifest repos-manifest.example.json --workers 4
-```
-
-Skip the sealed repo-quality-score phase:
-
-```bash
-org-analyser --github-org <ORG_NAME> --skip-quality-score
+org-analyser --github-org <ORG_NAME> --workers 10               # whole GitHub org
+org-analyser --github-repo <OWNER>/<REPO> --workers 1            # single GitHub repo
+org-analyser --gitlab-group <GROUP_NAME> --workers 10            # whole GitLab group
+org-analyser --gitlab-project <GROUP>/<PROJECT> --workers 1      # single GitLab project
+org-analyser --bitbucket-workspace <WORKSPACE_NAME> --workers 10 # whole Bitbucket workspace
+org-analyser --bitbucket-repo <WORKSPACE>/<REPO> --workers 1     # single Bitbucket repo
+org-analyser --local-repos-dir ./repos --workers 4               # local checkouts
+org-analyser --github-org <ORG_NAME> --skip-quality-score        # skip the sealed quality-score phase
 ```
 
 Any flag can instead be set as a default in `config.yml` — with a target and
