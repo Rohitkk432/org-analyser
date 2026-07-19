@@ -53,10 +53,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from .credential_redactor import scrub_secrets
-except ImportError:
-    from credential_redactor import scrub_secrets
+from llm.credential_redactor import scrub_secrets
 
 try:
     from .constants import (

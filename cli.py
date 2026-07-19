@@ -156,7 +156,7 @@ from analysis.merged_prs import (  # noqa: E402
     list_gitlab_projects,
     safe_filename,
 )
-from eval.credential_redactor import scrub_secrets  # noqa: E402
+from llm.credential_redactor import scrub_secrets  # noqa: E402
 from platforms.bitbucket import resolve_bitbucket_git_auth  # noqa: E402
 
 GITHUB_TOKEN_NAME = "github-data-token"
@@ -500,7 +500,7 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
     openai_key = resolve_openai_key(ctx.tokens)
     if openai_key:
         os.environ["OPENAI_API_KEY"] = openai_key
-    elif not azure_configured():
+    elif not azure_configured() and not ctx.local_only:
         errors.append(
             "Missing LLM credentials: set OPENAI_API_KEY (or openai_key= in the "
             "tokens file), or configure Azure with AZURE_OPENAI_ENDPOINT + "
@@ -986,6 +986,11 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         args.extend(["--repo-path", str(clone_path)])
     if ctx.skip_f2p:
         args.append("--skip-f2p")
+    if ctx.local_only:
+        # --local-only promises no repo content reaches an LLM provider; the
+        # quality checks and PR-rubrics scoring both call out to OpenAI/Gemini.
+        args.append("--skip-quality-llm")
+        args.append("--skip-pr-rubrics")
     args.extend(["--pr-rubrics-provider", ctx.pr_rubrics_provider])
 
     extra_env: dict[str, str] = {}
@@ -1603,8 +1608,26 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def print_transparency_banner(local_only: bool) -> None:
+    lines = [
+        "org-analyser — what this run does with your data:",
+        "  - Clones target repos locally; clones are deleted at the end of the run.",
+        "  - Committer names are kept in the report; committer emails are pseudonymised, never written out.",
+    ]
+    if local_only:
+        lines.append("  - --local-only: no code, diffs, or comments leave this machine.")
+    else:
+        lines.append(
+            "  - Code samples, diffs, and PR/review text are sent to the configured LLM "
+            "provider (OpenAI/Gemini) for scoring, redacted for secrets first."
+        )
+    lines.append("Full detail: SECURITY_AND_COMPLIANCE.md")
+    print("\n".join(lines), file=sys.stderr)
+
+
 def run_pipeline() -> int:
     args = parse_args()
+    print_transparency_banner(args.local_only)
     include_quality_score = not args.skip_quality_score
     ctx = build_run_context(args, include_quality_score=include_quality_score)
     ctx.run_dir.mkdir(parents=True, exist_ok=True)

@@ -488,7 +488,7 @@ def run_layer2_llm(
 ) -> Optional[Layer2Result]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     try:
-        from eval.llm_safety import llm_available, safe_openai
+        from llm.llm_safety import llm_available, safe_openai
     except ImportError:
         logger.warning("Layer2 skipped: openai package not installed")
         return Layer2Result(

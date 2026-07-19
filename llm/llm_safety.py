@@ -6,12 +6,12 @@ months. Construct clients with `safe_openai()` instead of `OpenAI()`, or call
 `safe_gemini()` instead of hand-rolling a Gemini request, and the redaction
 cannot be forgotten: it happens on the way out, inside the client/call.
 
-    from llm_safety import safe_openai
+    from llm.llm_safety import safe_openai
     client = safe_openai()                    # instead of OpenAI()
     client.chat.completions.create(...)       # messages redacted in flight
     client.beta.chat.completions.parse(...)   # same
 
-    from llm_safety import safe_gemini
+    from llm.llm_safety import safe_gemini
     text = safe_gemini(prompt)                # instead of requests.post(...)
 
 Only secret *values* are replaced ([REDACTED]); prose, code structure, diff
@@ -22,10 +22,7 @@ import logging
 import os
 from typing import Any
 
-try:
-    from .credential_redactor import redact_secrets
-except ImportError:
-    from credential_redactor import redact_secrets
+from .credential_redactor import redact_secrets
 
 logger = logging.getLogger(__name__)
 

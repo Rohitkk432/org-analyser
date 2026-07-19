@@ -92,7 +92,7 @@ from platforms.gitlab import paginate as gitlab_platform_paginate
 
 # Shared redacting OpenAI client. This script sends PR titles, bodies and human
 # review comments, so it must not construct a bare OpenAI() client.
-from eval.llm_safety import llm_available, safe_openai
+from llm.llm_safety import llm_available, safe_openai
 
 try:
     from dotenv import load_dotenv

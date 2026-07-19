@@ -35,11 +35,7 @@ from typing import Any, Literal
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, Field
 
-try:
-    from ..llm_safety import safe_openai
-except ImportError:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from llm_safety import safe_openai
+from llm.llm_safety import safe_openai
 
 from .taxonomy import (
     DiffStats,

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 def _get_openai_client():
     """Redacting LLM client from the environment (OpenAI or Azure)."""
     try:
-        from eval.llm_safety import llm_available, safe_openai
+        from llm.llm_safety import llm_available, safe_openai
     except ImportError:
         logger.warning("openai package not installed — LLM analysis will be skipped")
         return None

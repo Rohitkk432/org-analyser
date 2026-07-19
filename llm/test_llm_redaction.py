@@ -1,15 +1,10 @@
 """Nothing secret reaches an LLM provider.
 
-Run: python test_llm_redaction.py
+Run (from repo root): python -m llm.test_llm_redaction
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
-
-from eval.credential_redactor import redact_diff, redact_secrets
-from eval.llm_safety import _Guard
+from llm.credential_redactor import redact_diff, redact_secrets
+from llm.llm_safety import _Guard
 
 PEM = """-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEA7x9Kq2vN8fLmZ0pQrStUvWxYz1234567890abcdefghij
@@ -133,7 +128,7 @@ class _FakeChatCompletion:
 
 
 def test_quality_evaluator_openai_path_redacts_whole_prompt():
-    # _call_openai now goes through eval.llm_safety.safe_openai(), not a raw
+    # _call_openai now goes through llm.llm_safety.safe_openai(), not a raw
     # requests.post -- every interpolated field (diff, commit_message,
     # problem_statement) must still be redacted before it reaches the client.
     import eval.quality_evaluator as qe
@@ -160,7 +155,7 @@ def test_quality_evaluator_openai_path_redacts_whole_prompt():
 
 
 def test_quality_evaluator_gemini_path_redacts_prompt():
-    # _call_gemini delegates entirely to eval.llm_safety.safe_gemini() -- this
+    # _call_gemini delegates entirely to llm.llm_safety.safe_gemini() -- this
     # exercises that function's own redaction pass, not quality_evaluator's.
     # requests.post is patched on the shared `requests` module object, so it's
     # seen regardless of which module does `import requests` and calls it.
@@ -208,7 +203,7 @@ def test_quality_evaluator_gemini_path_redacts_prompt():
 
 def test_azure_selection_and_deployment_remap():
     import os
-    import eval.llm_safety as llm_safety
+    import llm.llm_safety as llm_safety
     from openai import AzureOpenAI, OpenAI
 
     saved = {k: os.environ.get(k) for k in

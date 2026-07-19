@@ -435,7 +435,7 @@ def run_taxonomy_for_accepted_prs(
     if skip_taxonomy:
         return dict(_EMPTY_RESULT), empty_per_pr
 
-    from eval.llm_safety import llm_available
+    from llm.llm_safety import llm_available
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not llm_available():
@@ -551,7 +551,7 @@ def run_taxonomy_classification(
     if skip_taxonomy:
         return dict(_EMPTY_RESULT)
 
-    from eval.llm_safety import llm_available
+    from llm.llm_safety import llm_available
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not llm_available():
