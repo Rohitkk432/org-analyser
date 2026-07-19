@@ -8,6 +8,8 @@ __pycache__/
 venv/
 env311/
 outputs/org-pipeline-runs/
+outputs/org-analyser-runs/
+*.egg-info/
 logs/
 *.log
 .DS_Store
