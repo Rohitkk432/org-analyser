@@ -158,7 +158,6 @@ Under the owner-run model, the surviving compliance obligations are operational,
 - **Prompt injection is unmitigated.** Untrusted repository content flows into LLM prompts whose outputs drive scoring. A repository can embed instructions to inflate its own score or suppress a finding. Bounded by §4.4 — it cannot reach code execution — and under the owner-run model the incentive to attack your own score is low. Treat scores from unreviewed repos as advisory.
 - **Redaction is pattern-based** (§4.2) and will not catch every bespoke secret format.
 - **Test code runs on the host**, not in a container (§4.1).
-- **`shell=True`** at [bulk_repo_evaluator_parallel.py:320](eval/bulk_repo_evaluator_parallel.py#L320) — fed internally-constructed commands today, but a shell-injection primitive waiting for a future caller.
 - **No dependency vulnerability scanning.** `pyproject.toml` pins only lower bounds. `pip-audit` in CI would close this.
 
 ---

@@ -852,6 +852,8 @@ class RepoAnalyzer:
         self.owner = owner
         self.repo_name_github = repo_name
         self.platform_client = platform_client
+        self._files_cache: Optional[List[Path]] = None
+        self._history_cache: Optional[Dict[str, Any]] = None
 
     def analyze(self) -> RepoMetrics:
         """Run full repository analysis."""
@@ -986,7 +988,13 @@ class RepoAnalyzer:
         )
 
     def _get_all_files(self) -> List[Path]:
-        """Get all files in repository."""
+        """Get all files in repository (cached -- called from both analyze() and
+        evaluate()'s later health-check pass against the same, unchanging clone)."""
+        if self._files_cache is None:
+            self._files_cache = self._get_all_files_uncached()
+        return self._files_cache
+
+    def _get_all_files_uncached(self) -> List[Path]:
         files = []
         if self.is_git_repo:
             try:
@@ -1525,8 +1533,6 @@ class RepoAnalyzer:
             )
         elif issue_refs > 5:
             score += 10
-            # strengths.append(
-            #     f"Some issue tracking ({issue_refs} commits reference issues)")
         elif issue_refs > 0:
             score += 5
         else:
@@ -1552,7 +1558,12 @@ class RepoAnalyzer:
         }
 
     def _analyze_git_history(self) -> Dict[str, Any]:
-        """Analyze git history."""
+        """Analyze git history (cached -- see _get_all_files)."""
+        if self._history_cache is None:
+            self._history_cache = self._analyze_git_history_uncached()
+        return self._history_cache
+
+    def _analyze_git_history_uncached(self) -> Dict[str, Any]:
         metrics = {}
         try:
             result = subprocess.run(
@@ -1911,6 +1922,12 @@ class RepoAnalyzer:
             return None
 
     def _analyze_svn_history(self) -> Dict[str, Any]:
+        """Analyze svn history (cached -- see _get_all_files)."""
+        if self._history_cache is None:
+            self._history_cache = self._analyze_svn_history_uncached()
+        return self._history_cache
+
+    def _analyze_svn_history_uncached(self) -> Dict[str, Any]:
         """Analyze Subversion history via `svn log --xml -v` (working copy)."""
         metrics: Dict[str, Any] = {}
         try:
@@ -2934,6 +2951,8 @@ class RepoEvaluator:
         pr_number: Optional[int] = None,
         skip_pr_rubrics: bool = False,
         pr_rubrics_provider: str = "openai",
+        rubrics_batch_work_dir: Optional[Path] = None,
+        rubrics_llm_mode: str = "auto",
     ):
         self.repo_path = repo_path
         self.owner = owner
@@ -2952,6 +2971,8 @@ class RepoEvaluator:
         self.language_config = load_language_config()
         self.skip_pr_rubrics = skip_pr_rubrics
         self.pr_rubrics_provider = pr_rubrics_provider
+        self.rubrics_batch_work_dir = rubrics_batch_work_dir
+        self.rubrics_llm_mode = rubrics_llm_mode
 
     def evaluate(self) -> AnalysisReport:
         if not self.platform_client:
@@ -3021,8 +3042,9 @@ class RepoEvaluator:
 
         pr_analysis = self._run_pr_rubrics(pr_analysis, language_config)
 
-        # Repo health checks
-        files = repo_analyzer._get_all_files()
+        # Repo health checks -- files/git_metrics come back from RepoAnalyzer's
+        # per-instance cache (already computed in .analyze() above), and
+        # comment_density likewise reuses that same analyze() pass.
         if repo_analyzer.is_git_repo:
             git_metrics = repo_analyzer._analyze_git_history()
         elif repo_analyzer.is_svn_repo:
@@ -3030,7 +3052,7 @@ class RepoEvaluator:
         else:
             git_metrics = {}
         readme_metrics = _find_readme_metrics(Path(self.repo_path))
-        comment_metrics = _estimate_comment_density(files)
+        comment_metrics = {"comment_density": repo_metrics.comment_density}
         process_health = compute_process_health_checks(
             repo_metrics=repo_metrics,
             pr_analysis=pr_analysis,
@@ -3275,7 +3297,11 @@ class RepoEvaluator:
             pr_analysis.pr_rubrics = []
             return pr_analysis
         try:
-            from eval.quality_evaluator import QualityEvaluator, split_patch_by_test_files
+            from eval.quality_evaluator import (
+                QualityEvaluator,
+                RubricCandidate,
+                split_patch_by_test_files,
+            )
         except ImportError:
             logger.warning("quality_evaluator module not found; skipping PR rubrics")
             pr_analysis.pr_rubrics = []
@@ -3293,6 +3319,15 @@ class RepoEvaluator:
         qe = QualityEvaluator(llm_provider=self.pr_rubrics_provider)
         results: List[dict] = []
 
+        # Collect every candidate's prompt inputs first (patch fetch and
+        # splitting are local git operations), then hand the whole set to
+        # evaluate_candidates so the LLM calls go through llm.batch's
+        # run_batch_or_sync -- a thread pool of live calls below its
+        # threshold, the Batch API above it -- instead of the old
+        # one-live-call-per-PR sequential loop.
+        candidates: List[RubricCandidate] = []
+        cand_entries: List[dict] = []
+
         for pr in pr_analysis.accepted_prs:
             pr_number = pr.get("number")
             if self.pr_number is not None and pr_number != self.pr_number:
@@ -3301,11 +3336,11 @@ class RepoEvaluator:
                 "number": pr_number,
                 "url": pr.get("url", ""),
             }
+            results.append(entry)
             base_sha = pr.get("baseRefOid", "") or ""
             head_sha = pr.get("headRefOid", "") or ""
             if not base_sha or not head_sha:
                 entry["error"] = "missing base or head SHA"
-                results.append(entry)
                 continue
 
             full_patch = pr_analyzer._get_patch_from_git(
@@ -3313,7 +3348,6 @@ class RepoEvaluator:
             )
             if not full_patch:
                 entry["error"] = "could not retrieve patch"
-                results.append(entry)
                 continue
 
             pr_files_nodes = pr.get("files", {}).get("nodes", [])
@@ -3327,28 +3361,42 @@ class RepoEvaluator:
             problem_statement = _problem_statement_for_pr(pr)
             commit_message = (pr.get("title") or "").strip()
 
-            try:
-                _passed, scores = qe.evaluate_candidate(
-                    src_diff,
-                    test_diff,
+            candidates.append(
+                RubricCandidate(
+                    src_diff=src_diff,
+                    test_diff=test_diff,
                     problem_statement=problem_statement or None,
                     hints="",
                     commit_message=commit_message,
                     files_changed=files_changed,
+                    label=f"PR #{pr_number}",
+                )
+            )
+            cand_entries.append(entry)
+
+        if candidates:
+            try:
+                scored = qe.evaluate_candidates(
+                    candidates,
+                    batch_work_dir=self.rubrics_batch_work_dir,
+                    tag=f"{self.owner}_{self.repo_name}",
+                    llm_mode=self.rubrics_llm_mode,
                 )
             except Exception as e:
-                logger.warning("PR rubrics failed for #%s: %s", pr_number, e)
-                entry["error"] = str(e)
-                results.append(entry)
-                continue
-
-            if scores is None:
-                entry["error"] = qe.last_rejection_reason or "evaluation_failed"
-                results.append(entry)
-                continue
-
-            entry["rubrics"] = scores.to_trimmed_rubrics_dict()
-            results.append(entry)
+                logger.warning(
+                    "PR rubrics failed for %s: %s", self.repo_full_name, e
+                )
+                for entry in cand_entries:
+                    entry["error"] = str(e)
+            else:
+                for entry, (_passed, scores, error) in zip(cand_entries, scored):
+                    if scores is None:
+                        logger.warning(
+                            "PR rubrics failed for #%s: %s", entry["number"], error
+                        )
+                        entry["error"] = error or "evaluation_failed"
+                    else:
+                        entry["rubrics"] = scores.to_trimmed_rubrics_dict()
 
         pr_analysis.pr_rubrics = results
         return pr_analysis
@@ -3363,8 +3411,6 @@ def print_report(report: AnalysisReport):
     print(f"Repository: {report.repo_full_name}")
     print(f"Language: {report.repo_metrics.primary_language}")
 
-    # print(f"Overall Score: {report.overall_score}/100")
-    # print(f"Recommendation: {report.recommendation}\n")
     print()
 
     print("--- Repository Metrics ---")
@@ -3432,26 +3478,6 @@ def print_report(report: AnalysisReport):
     if report.repo_metrics.ai_risk_signals:
         print(f"AI/vibe signals: {', '.join(report.repo_metrics.ai_risk_signals)}")
 
-    # if report.repo_metrics.process_health_summary:
-    #     summary = report.repo_metrics.process_health_summary
-    #     print(
-    #         f"\nRepository health checks: {summary.get('passed_count', 0)}/{summary.get('total_count', 0)} "
-    #         f"passed ({summary.get('pass_rate', 0)*100:.1f}%)"
-    #     )
-    # if report.repo_metrics.process_health_checks:
-    #     print("Repository health signals:")
-    #     ordered_keys = sorted(report.repo_metrics.process_health_checks.keys())
-    #     for key in ordered_keys:
-    #         check = report.repo_metrics.process_health_checks.get(key, {})
-    #         description = REPO_HEALTH_DESCRIPTIONS.get(key)
-    #         label = f"{key} ({description})" if description else key
-    #         print(f"  - {label}: {check.get('value')}")
-    #         # if "passed" in check:
-    #         #     passed = "✅" if check.get("passed") else "❌"
-    #         #     print(f"  {passed} {label}: {check.get('value')}")
-    #         # else:
-    #         #     print(f"  - {label}: {check.get('value')}")
-
     print(f"\n--- PR Analysis ---")
     print(f"Total PRs Analyzed: {report.pr_analysis.total_prs}")
     print(f"Passed First Filters PRs: {len(report.pr_analysis.accepted_prs)}")
@@ -3495,20 +3521,6 @@ def print_report(report: AnalysisReport):
     if report.pr_analysis.feature_accepted_prs:
         print(f"\n--- Feature PRs ---")
         print(f"Feature PRs: {report.pr_analysis.feature_accepted}")
-        # for pr in report.pr_analysis.feature_accepted_prs:
-        #     signals = ', '.join(pr.get('feature_signals', []))
-        #     print(
-        #         f"  - {pr['title']} (#{pr['number']}) [score={pr.get('feature_score', '?')}, {signals}]")
-        # if report.pr_analysis.feature_rejection_breakdown:
-        #     print(f"\nFeature Rejection Breakdown:")
-        #     sorted_rejections = sorted(
-        #         report.pr_analysis.feature_rejection_breakdown.items(),
-        #         key=lambda x: x[1]['count'],
-        #         reverse=True
-        #     )
-        #     for filter_name, stats in sorted_rejections:
-        #         print(
-        #             f" {filter_name}: {stats['count']} ({stats['percentage']}%)")
 
 
 def to_json(report: AnalysisReport) -> dict:
@@ -3608,8 +3620,6 @@ def to_json(report: AnalysisReport) -> dict:
     result = {
         "repo_name": report.repo_name,
         "repo_full_name": report.repo_full_name,
-        # 'overall_score': report.overall_score,
-        # 'recommendation': report.recommendation,
         "repo_metrics": repo_metrics_out,
         "pr_analysis": {
             "total_prs": report.pr_analysis.total_prs,
@@ -3623,20 +3633,12 @@ def to_json(report: AnalysisReport) -> dict:
             "pr_last_date": report.pr_analysis.pr_last_date,
             "pr_spread_days": report.pr_analysis.pr_spread_days,
             "pr_unique_dates_count": report.pr_analysis.pr_unique_dates_count,
-            # 'rejection_breakdown': report.pr_analysis.rejection_breakdown,
         },
     }
 
-    # Excluded from output format (kept in internal logic):
-    # repo_metrics_out['test_file_ratio'] = repo_metrics_json.get('test_file_ratio')
-    # repo_metrics_out['readiness_score'] = repo_metrics_json.get('readiness_score')
-    # repo_metrics_out['test_coverage_percentage'] = repo_metrics_json.get('test_coverage_percentage')
-    # repo_metrics_out['recommendation'] = repo_metrics_json.get('recommendation')
-    # repo_metrics_out['strengths'] = repo_metrics_json.get('strengths')
-    # repo_metrics_out['weaknesses'] = repo_metrics_json.get('weaknesses')
-    # repo_metrics_out['commit_spread_days'] = repo_metrics_json.get('commit_spread_days')
-    # repo_metrics_out['process_health_checks'] = repo_metrics_json.get('process_health_checks')
-    # repo_metrics_out['process_health_summary'] = repo_metrics_json.get('process_health_summary')
+    # test_file_ratio/readiness_score/test_coverage_percentage/recommendation/
+    # strengths/weaknesses/commit_spread_days/process_health_checks/
+    # process_health_summary are kept in internal logic but excluded here.
 
     if report.pr_analysis.f2p_results:
         result["pr_analysis"]["f2p_results"] = report.pr_analysis.f2p_results
@@ -3655,12 +3657,10 @@ def to_json(report: AnalysisReport) -> dict:
                     "url": pr.get("url"),
                     "baseRefOid": pr.get("baseRefOid"),
                     "headRefOid": pr.get("headRefOid"),
-                    # 'feature_score': pr.get('feature_score'),
                     "feature_signals": pr.get("feature_signals"),
                 }
                 for pr in report.pr_analysis.feature_accepted_prs
             ],
-            # 'rejection_breakdown': report.pr_analysis.feature_rejection_breakdown,
         }
 
     result["pr_rubrics"] = report.pr_analysis.pr_rubrics or []
@@ -4057,13 +4057,13 @@ def main():
         type=str,
         choices=("gemini", "openai"),
         default="openai",
-        help="LLM provider for PR rubrics: openai (OPENAI_API_KEY, default model gpt-5.1) or gemini (GEMINI_API_KEY)",
+        help="LLM provider for PR rubrics: openai (OPENAI_API_KEY, default model gpt-4o-mini) or gemini (GEMINI_API_KEY)",
     )
     parser.add_argument(
         "--taxonomy-model",
         type=str,
-        default=os.environ.get("TAXONOMY_MODEL", "gpt-4o"),
-        help="Model for taxonomy classification (default: gpt-4o or TAXONOMY_MODEL env)",
+        default=os.environ.get("TAXONOMY_MODEL", "gpt-4o-mini"),
+        help="Model for taxonomy classification (default: gpt-4o-mini or TAXONOMY_MODEL env)",
     )
     parser.add_argument(
         "--taxonomy-base-url",
@@ -4084,6 +4084,14 @@ def main():
         help="Taxonomy classification path: 'sync' = live chat.completions per PR "
         "(concurrent), 'batch' = OpenAI Batch API, 'auto' = batch once PR count "
         ">= threshold (default: auto).",
+    )
+    parser.add_argument(
+        "--rubrics-llm-mode",
+        choices=("auto", "batch", "sync"),
+        default="auto",
+        help="PR-rubrics scoring path: 'sync' = live chat.completions per PR "
+        "(concurrent), 'batch' = OpenAI Batch API, 'auto' = batch once accepted-PR "
+        "count >= threshold (default: auto).",
     )
 
     args = parser.parse_args()
@@ -4199,6 +4207,12 @@ def main():
             pr_number=args.pr_number,
             skip_pr_rubrics=args.skip_pr_rubrics,
             pr_rubrics_provider=args.pr_rubrics_provider,
+            rubrics_batch_work_dir=(
+                Path(args.output).parent / "batch_state" / "rubrics" / f"{owner}_{repo_name}"
+                if args.output
+                else None
+            ),
+            rubrics_llm_mode=args.rubrics_llm_mode,
         )
 
         report = evaluator.evaluate()

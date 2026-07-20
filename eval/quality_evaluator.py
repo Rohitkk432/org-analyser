@@ -2,9 +2,18 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
 
+from llm.batch import (
+    DEFAULT_BATCH_THRESHOLD,
+    DEFAULT_MAX_WORKERS,
+    BatchItem,
+    BatchItemResult,
+    run_batch_or_sync,
+)
 from llm.credential_redactor import redact_diff, redact_secrets, redaction_summary
 from llm.llm_safety import safe_gemini, safe_openai
 
@@ -363,34 +372,6 @@ Respond with ONLY this JSON (no markdown, no extra text):
 """
 
 
-F2P_P2P_CHECK_PROMPT = """Analyze if the test changes include both F2P (Fail-to-Pass) and P2P (Pass-to-Pass) tests.
-
-**F2P tests**: NEW tests that would FAIL before the fix and PASS after. They directly test the bug/feature being fixed.
-**P2P tests**: EXISTING tests that PASS both before and after the fix. They ensure no regressions. These are tests that existed before and still pass, or modifications to existing tests.
-
-## Source Code Changes:
-{src_diff}
-
-## Test Changes:
-{test_diff}
-
-IMPORTANT:
-- has_f2p MUST be false if estimated_f2p_tests is 0
-- has_p2p MUST be false if estimated_p2p_tests is 0
-- Be strict: if no clear evidence, set to false
-
-Respond with ONLY this JSON:
-{{
-  "has_f2p": <true ONLY if estimated_f2p_tests > 0>,
-  "has_p2p": <true ONLY if estimated_p2p_tests > 0>,
-  "estimated_f2p_tests": <number of F2P tests, 0 if none>,
-  "estimated_p2p_tests": <number of P2P tests, 0 if none>,
-  "f2p_evidence": "<brief description or 'none found'>",
-  "p2p_evidence": "<brief description or 'none found'>"
-}}
-"""
-
-
 INFER_PROBLEM_PROMPT = """Analyze this code change and infer the problem statement.
 
 **REJECT if:**
@@ -421,7 +402,53 @@ Respond with ONLY JSON (use "This change" not "This commit/PR" in rejection_reas
 
 
 # OpenAI Chat Completions model for rubric scoring (alias or snapshot id).
-DEFAULT_OPENAI_MODEL = "gpt-5.1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+
+@dataclass
+class RubricCandidate:
+    """One PR's inputs to evaluate_candidates -- the same fields
+    evaluate_candidate takes as arguments, collected up front so the whole
+    set can go through llm.batch's broker in two phases (infer, then score)
+    instead of one live call at a time."""
+
+    src_diff: str
+    test_diff: str
+    problem_statement: Optional[str] = None
+    hints: str = ""
+    commit_message: str = ""
+    files_changed: Optional[List[str]] = None
+    # Log-friendly identifier, e.g. "PR #123"; never sent to the API.
+    label: str = ""
+
+
+def _sync_rubrics_item(client: Any, item: BatchItem, max_retries: int = 3) -> BatchItemResult:
+    """The sync-fallback path run_batch_or_sync uses below its batch
+    threshold -- one live chat.completions.create call per PR, with the same
+    retry behaviour pr_task_profile's sync path uses."""
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=item.model,
+                temperature=item.temperature,
+                response_format=item.response_format,
+                messages=item.messages,
+            )
+            content = resp.choices[0].message.content or ""
+            return BatchItemResult(item.custom_id, True, content, None, item.metadata)
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            logger.warning(
+                "%s: rubrics LLM call failed (attempt %d/%d): %s",
+                item.metadata.get("label") or item.custom_id, attempt, max_retries, exc,
+            )
+            time.sleep(1.5 * attempt)
+    logger.error(
+        "%s: rubrics LLM call failed permanently: %s",
+        item.metadata.get("label") or item.custom_id, last_err,
+    )
+    return BatchItemResult(item.custom_id, False, None, last_err, item.metadata)
 
 
 class QualityEvaluator:
@@ -455,51 +482,6 @@ class QualityEvaluator:
                 or os.environ.get("OPENAI_API_KEY", "")
             )
         return ""
-
-    def check_f2p_p2p(
-        self, src_diff: str, test_diff: str
-    ) -> Tuple[bool, str, Optional[dict]]:
-        if not test_diff or not test_diff.strip():
-            return False, "No test changes found", None
-
-        prompt = F2P_P2P_CHECK_PROMPT.format(
-            src_diff=self._truncate_diff(src_diff, self.max_diff_lines // 2)
-            or "(No source changes)",
-            test_diff=self._truncate_diff(test_diff, self.max_diff_lines // 2),
-        )
-
-        data = self._parse_json_response(self._call_llm(prompt))
-        if not data:
-            return False, "Failed to analyze F2P/P2P tests", None
-
-        f2p_evidence = data.get("f2p_evidence", "")
-        p2p_evidence = data.get("p2p_evidence", "")
-        estimated_f2p = data.get("estimated_f2p_tests", 0)
-        estimated_p2p = data.get("estimated_p2p_tests", 0)
-
-        # Cross-validate: override boolean if estimated count is 0
-        has_f2p = data.get("has_f2p", False) and estimated_f2p > 0
-        has_p2p = data.get("has_p2p", False) and estimated_p2p > 0
-
-        stats = {
-            "estimated_f2p_tests": estimated_f2p,
-            "estimated_p2p_tests": estimated_p2p,
-            "f2p_evidence": f2p_evidence,
-            "p2p_evidence": p2p_evidence,
-        }
-
-        if not has_f2p and not has_p2p:
-            return (
-                False,
-                f"No F2P or P2P tests detected. F2P: {f2p_evidence}, P2P: {p2p_evidence}",
-                None,
-            )
-        if not has_f2p:
-            return False, f"No F2P tests detected: {f2p_evidence}", None
-        if not has_p2p:
-            return False, f"No P2P tests detected: {p2p_evidence}", None
-
-        return True, "", stats
 
     def evaluate_candidate(
         self,
@@ -574,9 +556,191 @@ class QualityEvaluator:
 
         return passes, scores
 
-    def _infer_problem_statement(
-        self, message: str, files: List[str], diff: str
-    ) -> Optional[dict]:
+    def evaluate_candidates(
+        self,
+        candidates: List[RubricCandidate],
+        *,
+        batch_work_dir: Optional[Path] = None,
+        tag: str = "rubrics",
+        llm_mode: str = "auto",
+        llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
+        max_workers: int = DEFAULT_MAX_WORKERS,
+    ) -> List[Tuple[bool, Optional[QualityScores], Optional[str]]]:
+        """Score a whole repo's accepted PRs through llm.batch's
+        run_batch_or_sync instead of one live call at a time: below the
+        threshold a thread pool of normal chat.completions.create calls,
+        above it the Batch API.
+
+        Runs in two broker phases because a candidate without a problem
+        statement needs one LLM call to infer it before the scoring prompt
+        can even be rendered -- the broker requires fully-materialized
+        prompts up front, so the dependency becomes phase 1 (infer) feeding
+        phase 2 (score).
+
+        Returns one (passes, scores, error) per candidate, in input order;
+        scores is None exactly when error is set.
+        """
+        if not candidates:
+            return []
+
+        if self.llm_provider != "openai":
+            # Gemini has no OpenAI-SDK-shaped client for the broker to drive
+            # (safe_gemini is a raw REST call), so it keeps the original
+            # one-candidate-at-a-time path.
+            out: List[Tuple[bool, Optional[QualityScores], Optional[str]]] = []
+            for cand in candidates:
+                try:
+                    passed, scores = self.evaluate_candidate(
+                        cand.src_diff,
+                        cand.test_diff,
+                        problem_statement=cand.problem_statement,
+                        hints=cand.hints,
+                        commit_message=cand.commit_message,
+                        files_changed=cand.files_changed,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    out.append((False, None, str(e)))
+                    continue
+                if scores is None:
+                    out.append((False, None, self.last_rejection_reason or "evaluation_failed"))
+                else:
+                    out.append((passed, scores, None))
+            return out
+
+        client = safe_openai(api_key=self.api_key or None)
+        work_dir = batch_work_dir or (Path("outputs") / "batch_state" / "rubrics" / tag)
+        sync_fn = lambda item: _sync_rubrics_item(client, item)  # noqa: E731
+
+        def make_item(idx: int, prompt: str, metadata: dict) -> BatchItem:
+            return BatchItem(
+                custom_id=str(idx),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a code review assistant. Respond only with valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.openai_model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                metadata=metadata,
+            )
+
+        results: List[Optional[Tuple[bool, Optional[QualityScores], Optional[str]]]] = [
+            None
+        ] * len(candidates)
+        statements: List[Optional[str]] = []
+        confidences: List[Optional[str]] = [None] * len(candidates)
+
+        for cand in candidates:
+            statements.append((cand.problem_statement or "").strip() or None)
+
+        # Phase 1: infer missing problem statements. Prompts use the raw
+        # diffs, same as evaluate_candidate -- redaction happens at the
+        # boundary either way (safe_openai's guarded client on the sync path,
+        # llm.batch's JSONL writer on the batch path).
+        infer_items: List[BatchItem] = []
+        for idx, cand in enumerate(candidates):
+            if statements[idx]:
+                continue
+            prompt = self._build_infer_prompt(
+                cand.commit_message,
+                cand.files_changed or [],
+                cand.src_diff + "\n" + cand.test_diff,
+            )
+            infer_items.append(make_item(idx, prompt, {"label": cand.label}))
+
+        if infer_items:
+            logger.info("Inferring problem statements for %d candidate(s)...", len(infer_items))
+            infer_results = run_batch_or_sync(
+                client,
+                infer_items,
+                work_dir,
+                tag=f"{tag}-infer",
+                sync_fn=sync_fn,
+                mode=llm_mode,
+                threshold=llm_batch_threshold,
+                max_workers=max_workers,
+            )
+            for r in infer_results:
+                idx = int(r.custom_id)
+                data = self._parse_json_response(r.content) if r.ok else None
+                statement = (data or {}).get("problem_statement")
+                if not statement:
+                    results[idx] = (False, None, "Could not infer problem statement")
+                    continue
+                statements[idx] = statement
+                confidences[idx] = (data or {}).get("confidence")
+
+        # Phase 2: score every candidate that has a problem statement.
+        # Diffs get the same diff-aware redaction evaluate_candidate applies
+        # before rendering the scoring prompt.
+        score_items: List[BatchItem] = []
+        for idx, cand in enumerate(candidates):
+            if results[idx] is not None:
+                continue
+            src_diff_for_llm, src_stats = redact_diff(cand.src_diff)
+            test_diff_for_llm, test_stats = redact_diff(cand.test_diff)
+            if src_stats.get("redacted") or test_stats.get("redacted"):
+                logger.info(
+                    "Redacted secrets from diffs before LLM analysis - src: %s, test: %s",
+                    redaction_summary(src_stats.get("secrets_by_type", {}).items()),
+                    redaction_summary(test_stats.get("secrets_by_type", {}).items()),
+                )
+            no_tests = (not test_diff_for_llm) or (not test_diff_for_llm.strip())
+            if no_tests:
+                prompt = self._build_no_tests_prompt(
+                    statements[idx], cand.hints, src_diff_for_llm
+                )
+            else:
+                prompt = self._build_unified_prompt(
+                    statements[idx], cand.hints, src_diff_for_llm, test_diff_for_llm
+                )
+            score_items.append(
+                make_item(idx, prompt, {"label": cand.label, "no_tests": no_tests})
+            )
+
+        if score_items:
+            logger.info(
+                "Scoring %d candidate(s) with model=%s (llm_mode=%s; batches once "
+                "count >= %d, otherwise %d sync workers)...",
+                len(score_items), self.openai_model, llm_mode, llm_batch_threshold, max_workers,
+            )
+            score_results = run_batch_or_sync(
+                client,
+                score_items,
+                work_dir,
+                tag=f"{tag}-score",
+                sync_fn=sync_fn,
+                mode=llm_mode,
+                threshold=llm_batch_threshold,
+                max_workers=max_workers,
+            )
+            for r in score_results:
+                idx = int(r.custom_id)
+                data = self._parse_json_response(r.content) if r.ok else None
+                scores = None
+                if data:
+                    scores = (
+                        self._scores_from_no_tests_data(data)
+                        if r.metadata.get("no_tests")
+                        else self._scores_from_data(data)
+                    )
+                if scores is None:
+                    results[idx] = (
+                        False,
+                        None,
+                        r.error or "LLM evaluation failed to return scores",
+                    )
+                    continue
+                scores.inferred_problem_statement = statements[idx]
+                scores.inference_confidence = confidences[idx]
+                results[idx] = (scores.passes_threshold(self.quality_threshold), scores, None)
+
+        return [r if r is not None else (False, None, "no result") for r in results]
+
+    def _build_infer_prompt(self, message: str, files: List[str], diff: str) -> str:
         diff_lines = diff.split("\n")
         if len(diff_lines) > self.max_diff_lines:
             diff = (
@@ -584,11 +748,16 @@ class QualityEvaluator:
                 + f"\n\n... (truncated {len(diff_lines) - self.max_diff_lines} lines)"
             )
 
-        prompt = INFER_PROBLEM_PROMPT.format(
+        return INFER_PROBLEM_PROMPT.format(
             message=message or "(No message)",
             file_list="\n".join(f"- {f}" for f in files[:50]) or "(No files)",
             diff=diff,
         )
+
+    def _infer_problem_statement(
+        self, message: str, files: List[str], diff: str
+    ) -> Optional[dict]:
+        prompt = self._build_infer_prompt(message, files, diff)
         return self._parse_json_response(self._call_llm(prompt))
 
     def _evaluate_quality_no_tests(
@@ -597,17 +766,21 @@ class QualityEvaluator:
         """
         Evaluate only non-test rubrics. Test-related rubrics are forced to 3 with fixed rationales.
         """
-        prompt = NO_TESTS_EVALUATION_PROMPT.format(
+        prompt = self._build_no_tests_prompt(problem_statement, hints, src_diff)
+        data = self._parse_json_response(self._call_llm(prompt))
+        if not data:
+            return None
+        return self._scores_from_no_tests_data(data)
+
+    def _build_no_tests_prompt(self, problem_statement: str, hints: str, src_diff: str) -> str:
+        return NO_TESTS_EVALUATION_PROMPT.format(
             problem_statement=problem_statement or "(Not provided)",
             hints=hints or "(No hints)",
             src_diff=self._truncate_diff(src_diff, self.max_diff_lines)
             or "(No source changes)",
         )
 
-        data = self._parse_json_response(self._call_llm(prompt))
-        if not data:
-            return None
-
+    def _scores_from_no_tests_data(self, data: dict) -> Optional[QualityScores]:
         try:
             issue_clarity = int(data.get("issue_clarity", 3))
             issue_clarity_label = data.get("issue_clarity_label", "Unknown")
@@ -651,7 +824,16 @@ class QualityEvaluator:
     def _evaluate_quality(
         self, problem_statement: str, hints: str, src_diff: str, test_diff: str
     ) -> Optional[QualityScores]:
-        prompt = UNIFIED_EVALUATION_PROMPT.format(
+        prompt = self._build_unified_prompt(problem_statement, hints, src_diff, test_diff)
+        data = self._parse_json_response(self._call_llm(prompt))
+        if not data:
+            return None
+        return self._scores_from_data(data)
+
+    def _build_unified_prompt(
+        self, problem_statement: str, hints: str, src_diff: str, test_diff: str
+    ) -> str:
+        return UNIFIED_EVALUATION_PROMPT.format(
             problem_statement=problem_statement or "(Not provided)",
             hints=hints or "(No hints)",
             src_diff=self._truncate_diff(src_diff, self.max_diff_lines // 2)
@@ -660,10 +842,7 @@ class QualityEvaluator:
             or "(No test changes)",
         )
 
-        data = self._parse_json_response(self._call_llm(prompt))
-        if not data:
-            return None
-
+    def _scores_from_data(self, data: dict) -> Optional[QualityScores]:
         try:
             return QualityScores(
                 # Existing rubrics

@@ -29,7 +29,7 @@ import sys
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -40,6 +40,18 @@ from platforms.base import ci_headers, request_with_retry
 
 CSV_FIELDS = ["platform", "org", "repo", "merged_count", "error"]
 SUMMARY_FIELDS = ["platform", "org", "repos_total", "merged_total", "token_name", "error"]
+
+ProgressCb = Optional[Callable[[str], None]]
+
+
+def _emit(progress_cb: ProgressCb, msg: str) -> None:
+    """Default to stdout for standalone/CLI use; callers embedding this module
+    in-process (e.g. the rich progress UI) pass a callback instead so raw
+    prints never fight the terminal's live rendering."""
+    if progress_cb is not None:
+        progress_cb(msg)
+    else:
+        print(msg, flush=True)
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -432,6 +444,7 @@ def export_github_org(
     token_name: str,
     output_dir: Path,
     host: str = "github.com",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     filename = safe_filename(f"github_{org}.csv")
     out_path = output_dir / filename
@@ -456,7 +469,7 @@ def export_github_org(
             "csv_path": str(out_path),
         }
 
-    print(f"  GitHub {org}: {len(repos)} repos", flush=True)
+    _emit(progress_cb, f"  GitHub {org}: {len(repos)} repos")
     for idx, repo in enumerate(repos, start=1):
         error = ""
         count = 0
@@ -468,7 +481,7 @@ def export_github_org(
             {"platform": "github", "org": org, "repo": repo, "merged_count": count, "error": error}
         )
         if idx % 10 == 0 or idx == len(repos):
-            print(f"    [{idx}/{len(repos)}] latest={repo} count={count}", flush=True)
+            _emit(progress_cb, f"    [{idx}/{len(repos)}] latest={repo} count={count}")
 
     merged_total = write_org_csv(out_path, "github", org, rows)
     return {
@@ -488,6 +501,7 @@ def export_gitlab_project(
     token_name: str,
     output_dir: Path,
     host: str = "gitlab.com",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Export merged MR count for a single GitLab project (group/subgroup/project)."""
     project = project.strip().strip("/")
@@ -505,7 +519,7 @@ def export_gitlab_project(
         {"platform": "gitlab", "org": namespace, "repo": project, "merged_count": count, "error": error}
     ]
     merged_total = write_org_csv(out_path, "gitlab", namespace, rows)
-    print(f"  GitLab project {project}: merged_count={count}", flush=True)
+    _emit(progress_cb, f"  GitLab project {project}: merged_count={count}")
     return {
         "platform": "gitlab",
         "org": namespace,
@@ -524,6 +538,7 @@ def export_github_repos(
     token_name: str,
     output_dir: Path,
     host: str = "github.com",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Export merged PR counts for one or more specific GitHub repos (owner/repo)."""
     normalized: list[str] = []
@@ -546,7 +561,7 @@ def export_github_repos(
     rows: list[dict[str, Any]] = []
     org_error = ""
 
-    print(f"  GitHub repos: {len(normalized)} repo(s)", flush=True)
+    _emit(progress_cb, f"  GitHub repos: {len(normalized)} repo(s)")
     for idx, repo in enumerate(normalized, start=1):
         owner = repo.split("/")[0]
         error = ""
@@ -559,7 +574,7 @@ def export_github_repos(
         rows.append(
             {"platform": "github", "org": owner, "repo": repo, "merged_count": count, "error": error}
         )
-        print(f"    [{idx}/{len(normalized)}] {repo} count={count}", flush=True)
+        _emit(progress_cb, f"    [{idx}/{len(normalized)}] {repo} count={count}")
 
     merged_total = write_org_csv(out_path, "github", normalized[0].split("/")[0], rows)
     return {
@@ -580,6 +595,7 @@ def _export_bitbucket(
     token_name: str,
     output_dir: Path,
     username: str = "",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Shared merged-PR-count export for Bitbucket repos (workspace/repo)."""
     filename = safe_filename(f"{workspace_label}.csv")
@@ -588,7 +604,7 @@ def _export_bitbucket(
     rows: list[dict[str, Any]] = []
     org_error = ""
 
-    print(f"  Bitbucket repos: {len(repos)} repo(s)", flush=True)
+    _emit(progress_cb, f"  Bitbucket repos: {len(repos)} repo(s)")
     for idx, repo in enumerate(repos, start=1):
         workspace = repo.split("/")[0]
         error = ""
@@ -601,7 +617,7 @@ def _export_bitbucket(
         rows.append(
             {"platform": "bitbucket", "org": workspace, "repo": repo, "merged_count": count, "error": error}
         )
-        print(f"    [{idx}/{len(repos)}] {repo} count={count}", flush=True)
+        _emit(progress_cb, f"    [{idx}/{len(repos)}] {repo} count={count}")
 
     merged_total = write_org_csv(out_path, "bitbucket", repos[0].split("/")[0], rows)
     return {
@@ -621,10 +637,11 @@ def export_bitbucket_workspace(
     token_name: str,
     output_dir: Path,
     username: str = "",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Export merged PR counts for every repo in a Bitbucket workspace."""
     repos = list_bitbucket_repos(token, workspace, username)
-    return _export_bitbucket(token, repos, workspace, token_name, output_dir, username)
+    return _export_bitbucket(token, repos, workspace, token_name, output_dir, username, progress_cb)
 
 
 def export_bitbucket_repos(
@@ -633,6 +650,7 @@ def export_bitbucket_repos(
     token_name: str,
     output_dir: Path,
     username: str = "",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Export merged PR counts for one or more specific Bitbucket repos."""
     normalized: list[str] = []
@@ -648,7 +666,7 @@ def export_bitbucket_repos(
     if not normalized:
         raise ValueError("At least one Bitbucket repo path is required")
     label = normalized[0].replace("/", "_") if len(normalized) == 1 else f"bitbucket_repos_{len(normalized)}"
-    return _export_bitbucket(token, normalized, label, token_name, output_dir, username)
+    return _export_bitbucket(token, normalized, label, token_name, output_dir, username, progress_cb)
 
 
 def export_gitlab_projects(
@@ -657,6 +675,7 @@ def export_gitlab_projects(
     token_name: str,
     output_dir: Path,
     host: str = "gitlab.com",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     """Export merged MR counts for one or more GitLab projects into a single CSV."""
     normalized = []
@@ -670,14 +689,14 @@ def export_gitlab_projects(
     if not normalized:
         raise ValueError("At least one GitLab project path is required")
     if len(normalized) == 1:
-        return export_gitlab_project(token, normalized[0], token_name, output_dir, host)
+        return export_gitlab_project(token, normalized[0], token_name, output_dir, host, progress_cb)
 
     filename = safe_filename(f"gitlab_projects_{len(normalized)}.csv")
     out_path = output_dir / filename
     rows: list[dict[str, Any]] = []
     org_error = ""
 
-    print(f"  GitLab projects batch: {len(normalized)} projects", flush=True)
+    _emit(progress_cb, f"  GitLab projects batch: {len(normalized)} projects")
     for idx, project in enumerate(normalized, start=1):
         namespace = "/".join(project.split("/")[:-1]) or project
         error = ""
@@ -692,7 +711,7 @@ def export_gitlab_projects(
             {"platform": "gitlab", "org": namespace, "repo": project, "merged_count": count, "error": error}
         )
         if idx % 10 == 0 or idx == len(normalized):
-            print(f"    [{idx}/{len(normalized)}] latest={project} count={count}", flush=True)
+            _emit(progress_cb, f"    [{idx}/{len(normalized)}] latest={project} count={count}")
 
     merged_total = write_org_csv(out_path, "gitlab", "gitlab-projects", rows)
     return {
@@ -713,6 +732,7 @@ def export_gitlab_group(
     token_name: str,
     output_dir: Path,
     host: str = "gitlab.com",
+    progress_cb: ProgressCb = None,
 ) -> dict[str, Any]:
     filename = safe_filename(f"gitlab_{group.replace('/', '_')}.csv")
     out_path = output_dir / filename
@@ -737,7 +757,7 @@ def export_gitlab_group(
             "csv_path": str(out_path),
         }
 
-    print(f"  GitLab {group}: {len(projects)} projects", flush=True)
+    _emit(progress_cb, f"  GitLab {group}: {len(projects)} projects")
     for idx, project in enumerate(projects, start=1):
         error = ""
         count = 0
@@ -749,7 +769,7 @@ def export_gitlab_group(
             {"platform": "gitlab", "org": group, "repo": project, "merged_count": count, "error": error}
         )
         if idx % 10 == 0 or idx == len(projects):
-            print(f"    [{idx}/{len(projects)}] latest={project} count={count}", flush=True)
+            _emit(progress_cb, f"    [{idx}/{len(projects)}] latest={project} count={count}")
 
     merged_total = write_org_csv(out_path, "gitlab", group, rows)
     return {

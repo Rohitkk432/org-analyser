@@ -81,13 +81,6 @@ equivalent (see `run_all_repos.py --help`).
 Output lands under `eval_results/<org>/<repo>/<repo>.{json,csv}`, plus a `_summary.json`
 with counts, timing, and failures.
 
-## Bulk SVN
-
-```bash
-# svn_urls.txt: one URL per line, optional |revision suffix
-bulk-svn-evaluator --urls-file svn_urls.txt --workers 4 --svn-username USER --token PASS
-```
-
 ## Cybersecurity PR scanner
 
 Heuristic + optional LLM scoring of PRs for security relevance:
@@ -119,8 +112,7 @@ streamlit run eval/ui/github_eval_picker.py
 
 ## Utility scripts
 
-`consolidate_output.py` (merge CSVs), `transpose_csv.py` (transpose a CSV),
-`bulk_repo_evaluator_parallel.py` (bulk evaluator for a hardcoded repo list).
+`consolidate_output.py` (merge CSVs), `transpose_csv.py` (transpose a CSV).
 
 ## License
 

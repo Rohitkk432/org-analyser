@@ -35,7 +35,7 @@ from openai import APIConnectionError, APITimeoutError, InternalServerError, Rat
 from openai.lib._parsing._completions import type_to_response_format_param
 from pydantic import BaseModel, Field
 
-from llm.batch import BatchItem, BatchItemResult, run_batch_or_sync
+from llm.batch import DEFAULT_BATCH_THRESHOLD, BatchItem, BatchItemResult, run_batch_or_sync
 from llm.llm_safety import safe_openai
 
 from .taxonomy import (
@@ -125,7 +125,7 @@ class TaxonomyClassifier:
         self,
         api_key: str | None = None,
         base_url: str = "https://api.openai.com/v1",
-        model: str = "gpt-4o",
+        model: str = "gpt-4o-mini",
         taxonomy_path: str | Path | None = None,
         concurrency: int = 32,
     ):
@@ -227,7 +227,7 @@ class TaxonomyClassifier:
         language_col: str | None = "language",
         batch_work_dir: Path | None = None,
         llm_mode: str = "auto",
-        llm_batch_threshold: int = 50,
+        llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
         tag: str = "taxonomy",
     ) -> list[dict[str, Any]]:
         """Classify a list of items via llm.batch.run_batch_or_sync.

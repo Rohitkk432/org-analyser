@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -12,6 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 from eval.task_taxonomy.classify import TaxonomyClassifier
+from llm.batch import DEFAULT_BATCH_THRESHOLD, DEFAULT_MAX_WORKERS
 
 logger = logging.getLogger(__name__)
 
@@ -38,98 +38,6 @@ _EMPTY_RESULT: dict[str, str] = {col: "" for col in TAXONOMY_COLUMNS}
 
 _CONF_ORDER: dict[str, int] = {"high": 3, "medium": 2, "low": 1}
 _CONF_REVERSE: dict[int, str] = {3: "high", 2: "medium", 1: "low"}
-
-_README_CANDIDATES = [
-    "README.md",
-    "README.MD",
-    "readme.md",
-    "Readme.md",
-    "README.rst",
-    "README",
-]
-
-
-def _read_readme(repo_path: str | Path) -> str:
-    """Read the first README found in the repo root (up to 4000 chars)."""
-    root = Path(repo_path)
-    for name in _README_CANDIDATES:
-        path = root / name
-        if path.exists():
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-                return text[:4000]
-            except Exception:
-                return ""
-    return ""
-
-
-def _get_file_tree_summary(repo_path: str | Path, max_entries: int = 80) -> str:
-    """Return a compact summary of the repo's top-level file structure."""
-    root = Path(repo_path)
-    entries: list[str] = []
-    try:
-        for item in sorted(root.iterdir()):
-            if item.name.startswith("."):
-                continue
-            prefix = "dir " if item.is_dir() else "file"
-            entries.append(f"  {prefix}  {item.name}")
-            if len(entries) >= max_entries:
-                entries.append(
-                    f"  ... ({sum(1 for _ in root.iterdir())} total entries)"
-                )
-                break
-    except Exception:
-        pass
-    return "\n".join(entries)
-
-
-def _get_recent_git_log(repo_path: str | Path, max_commits: int = 20) -> str:
-    """Return `git log --stat` for recent commits as a lightweight activity proxy."""
-    try:
-        result = subprocess.run(
-            ["git", "log", f"--max-count={max_commits}", "--stat", "--oneline"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            return output[:6000] if output else ""
-    except Exception:
-        pass
-    return ""
-
-
-def _build_repo_query(
-    owner: str,
-    repo: str,
-    repo_path: str | Path,
-    primary_language: str,
-) -> str:
-    """Build a descriptive query string for the taxonomy classifier from repo metadata."""
-    readme = _read_readme(repo_path)
-    file_tree = _get_file_tree_summary(repo_path)
-
-    parts = [
-        f"# Repository: {owner}/{repo}",
-        f"Primary language: {primary_language}" if primary_language else "",
-    ]
-
-    if readme:
-        parts.append(f"\n## README\n{readme}")
-
-    if file_tree:
-        parts.append(f"\n## File structure (root)\n{file_tree}")
-
-    parts.append(
-        "\nClassify this repository's primary purpose and domain. "
-        "Determine what archetype of work this project represents, "
-        "its scope/horizon, and applicable tags."
-    )
-
-    return "\n".join(p for p in parts if p)
 
 
 def _serialise_result(raw: dict[str, Any]) -> dict[str, Any]:
@@ -418,14 +326,14 @@ def run_taxonomy_for_accepted_prs(
     primary_language: str,
     get_patch: Callable[[dict[str, Any]], str | None],
     *,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
     base_url: str = "https://api.openai.com/v1",
     skip_taxonomy: bool = False,
     pr_number: int | None = None,
-    concurrency: int = 8,
+    concurrency: int = DEFAULT_MAX_WORKERS,
     batch_work_dir: Path | None = None,
     llm_mode: str = "auto",
-    llm_batch_threshold: int = 50,
+    llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     Classify each accepted PR; aggregate successful rows into repo-level columns.
@@ -542,72 +450,4 @@ def run_taxonomy_for_accepted_prs(
     merged = aggregate_pr_taxonomy(good_rows, good_nums)
     return _serialise_result(merged), per_pr_out
 
-
-def run_taxonomy_classification(
-    owner: str,
-    repo: str,
-    repo_path: str | Path,
-    primary_language: str = "",
-    model: str = "gpt-4o",
-    base_url: str = "https://api.openai.com/v1",
-    skip_taxonomy: bool = False,
-) -> dict[str, Any]:
-    """Run taxonomy classification on a repository (legacy: README + git log, not PR-based).
-
-    Returns a dict with the 16 taxonomy column values.
-    On error or skip, returns empty strings for all columns.
-    """
-    if skip_taxonomy:
-        return dict(_EMPTY_RESULT)
-
-    from llm.llm_safety import llm_available
-
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not llm_available():
-        logger.warning(
-            "No LLM configured (OpenAI or Azure) — taxonomy classification will be skipped"
-        )
-        return dict(_EMPTY_RESULT)
-
-    query = _build_repo_query(owner, repo, repo_path, primary_language)
-    git_log = _get_recent_git_log(repo_path)
-
-    logger.info(
-        "Running legacy repo-level taxonomy for %s/%s (model=%s) ...",
-        owner,
-        repo,
-        model,
-    )
-
-    try:
-        classifier = TaxonomyClassifier(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            concurrency=1,
-        )
-
-        result = classifier.classify(
-            query=query,
-            repo=f"{owner}/{repo}",
-            diff=git_log,
-            language=primary_language,
-        )
-
-        if result.get("error"):
-            logger.warning(
-                "Taxonomy classification error for %s/%s: %s",
-                owner,
-                repo,
-                result["error"],
-            )
-            return dict(_EMPTY_RESULT)
-
-        return _serialise_result(result)
-
-    except Exception as e:
-        logger.warning(
-            "Taxonomy classification exception for %s/%s: %s", owner, repo, e
-        )
-        return dict(_EMPTY_RESULT)
 
