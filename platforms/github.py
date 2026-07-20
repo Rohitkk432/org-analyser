@@ -46,6 +46,7 @@ class GitHubClient(PlatformClient):
               pullRequests(
                 first: $page_size,
                 after: $cursor,
+                states: MERGED,
                 orderBy: {field: CREATED_AT, direction: DESC}
               ) {
                 pageInfo {
@@ -95,14 +96,9 @@ class GitHubClient(PlatformClient):
             }
           }
         """
-        query_string = f"repo:{self.owner}/{self.repo_name} is:pr is:merged"
-        if start_date:
-            query_string += f" merged:>={start_date}"
-
         variables = {
             "owner": self.owner,
             "name": self.repo_name,
-            "queryString": query_string,
             "cursor": cursor,
             "page_size": page_size,
         }

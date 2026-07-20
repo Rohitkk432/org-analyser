@@ -1,9 +1,6 @@
 """
 Production quality assessment across multiple repos — clone-based, with optional LLM.
 
-Excludes files authored by pr-sourcing accounts (via git blame).
-Only evaluates code written by the original developers.
-
 Supports Python and JavaScript/TypeScript repos (auto-detected per repo).
 
 10 Criteria (each scored 1-5, 1=excellent, 5=poor):
@@ -26,26 +23,27 @@ LLM deep analysis (--skip-llm to disable):
 
 Grades: CLEAN (<=10) | MINOR (<=18) | MODERATE (<=28) | CRITICAL (>28)
 
-Usage:
-    python tools/production_quality_check.py \\
-        --owner octocat \\
-        --repos "core,eventify,..." \\
-        [--skip-llm] [--model gpt-4o]
+Invoked via eval.quality_checks.run_production_quality_check — no standalone CLI.
 """
 
-import csv
 import hashlib
 import json
 import os
 import re
 import shutil
-import subprocess
-import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from eval.quality_check_common import budget_fill_samples
+from eval.quality_check_common import clone_repo as _clone_repo
+from eval.quality_check_common import detect_language as _detect_language_impl
+from eval.quality_check_common import find_files as _find_files_impl
+from eval.quality_check_common import is_test_file as _is_test_file_impl
+from eval.quality_check_common import read_file as _read
+from eval.quality_check_common import rel_path as _rel
+from eval.quality_check_common import run_git as _run_git
 from llm.credential_redactor import redact_secrets
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
@@ -105,9 +103,7 @@ TOOLGEN_DIRS = {
 
 def _detect_language(files: list[str]) -> str:
     """Return 'python' or 'js' based on dominant file extension count."""
-    py_count = sum(1 for f in files if os.path.splitext(f)[1] in PYTHON_EXTS)
-    js_count = sum(1 for f in files if os.path.splitext(f)[1] in JS_EXTS)
-    return "python" if py_count >= js_count else "js"
+    return _detect_language_impl(files, PYTHON_EXTS, JS_EXTS)
 
 
 # ---------------------------------------------------------------------------
@@ -293,111 +289,15 @@ PATTERNS_DEBT = {
 # ---------------------------------------------------------------------------
 
 
-def _run_git(args: list[str], cwd: str) -> str:
-    try:
-        r = subprocess.run(
-            ["git"] + args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return r.stdout.strip()
-    except Exception:
-        return ""
-
-
-def _clone_repo(owner: str, repo: str, dest: str, token: str) -> tuple[bool, str]:
-    url = (
-        f"https://{token}@github.com/{owner}/{repo}.git"
-        if token
-        else f"https://github.com/{owner}/{repo}.git"
-    )
-    r = subprocess.run(
-        ["git", "clone", "--depth", "200", url, dest],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if r.returncode != 0:
-        return False, r.stderr.strip()
-    return True, ""
+_TEST_KEYWORDS = ("test", "spec", "__tests__", "tests/", "testing/")
 
 
 def _find_files(root: str, extensions: set[str]) -> list[str]:
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames if d not in EXCLUDE_DIRS and d not in TOOLGEN_DIRS
-        ]
-        for f in filenames:
-            if os.path.splitext(f)[1] in extensions:
-                results.append(os.path.join(dirpath, f))
-    return results
-
-
-def _read(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except Exception:
-        return ""
-
-
-def _rel(path: str, root: str) -> str:
-    return os.path.relpath(path, root)
+    return _find_files_impl(root, extensions, EXCLUDE_DIRS | TOOLGEN_DIRS)
 
 
 def _is_test_file(path: str, root: str) -> bool:
-    rel = _rel(path, root).lower()
-    return any(p in rel for p in ["test", "spec", "__tests__", "tests/", "testing/"])
-
-
-def _is_sourcing_file(filepath: str, root: str, patterns: list[str]) -> bool:
-    """Return True if >50% of lines are authored by sourcing-pattern accounts."""
-    if not patterns:
-        return False
-    blame = _run_git(["blame", "--porcelain", _rel(filepath, root)], root)
-    if not blame:
-        return False
-
-    total_lines = 0
-    sourcing_lines = 0
-    author = ""
-    email = ""
-
-    for line in blame.split("\n"):
-        if line.startswith("author "):
-            author = line[7:].strip().lower()
-        elif line.startswith("author-mail "):
-            email = line[12:].strip().lower().strip("<>")
-            combined = f"{author} {email}"
-            is_sourcing = any(p in combined for p in patterns)
-            total_lines += 1
-            if is_sourcing:
-                sourcing_lines += 1
-
-    if total_lines == 0:
-        return False
-    return (sourcing_lines / total_lines) > 0.5
-
-
-def _filter_non_sourcing_files(
-    root: str, files: list[str], patterns: list[str], verbose_log=None
-) -> list[str]:
-    if not patterns:
-        return files
-    kept, excluded = [], 0
-    for f in files:
-        if _is_sourcing_file(f, root, patterns):
-            excluded += 1
-        else:
-            kept.append(f)
-    if verbose_log and excluded:
-        verbose_log(
-            f"      Excluded {excluded} sourcing-authored files, kept {len(kept)}"
-        )
-    return kept
+    return _is_test_file_impl(path, root, _TEST_KEYWORDS)
 
 
 def _count_params(param_str: str, is_python: bool = False) -> int:
@@ -1442,22 +1342,17 @@ def _smart_sample(
 
     ordered = sorted(non_test, key=lambda f: -scored[f])
 
-    snippets: list[str] = []
-    total_chars = 0
-    for f in ordered:
+    def _snippet(f: str) -> str:
         content = _read(f)
         if not content.strip():
-            continue
+            return ""
         lines = content.split("\n")
         # Take up to 80 lines per file
         sample = "\n".join(f"{i + 1}: {l}" for i, l in enumerate(lines[:80]))
-        chunk = f"\n--- {_rel(f, root)} ---\n{sample}\n"
-        if total_chars + len(chunk) > char_budget:
-            break
-        snippets.append(chunk)
-        total_chars += len(chunk)
+        return f"\n--- {_rel(f, root)} ---\n{sample}\n"
 
-    return "".join(snippets)
+    text, _, _ = budget_fill_samples(ordered, _snippet, char_budget)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1641,7 +1536,6 @@ def _check_repo(
         "grade": "?",
         "criteria": {},
         "files_analyzed": 0,
-        "files_excluded_sourcing": 0,
         "error": None,
     }
 
@@ -1686,9 +1580,7 @@ def _check_repo(
             f"    Detected language: {lang} | {len(all_source)} source files found"
         )
 
-    files_before = len(all_source)
-    source_files = _filter_non_sourcing_files(root, all_source, verbose_log)
-    result["files_excluded_sourcing"] = files_before - len(source_files)
+    source_files = all_source
     result["files_analyzed"] = len(source_files)
 
     if not source_files:
@@ -1776,10 +1668,3 @@ def _check_repo(
     if owns_clone:
         shutil.rmtree(clone_dir, ignore_errors=True)
     return result
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-CRITERIA_SHORT = ["Err", "Log", "Cfg", "DB", "API", "Res", "Arch", "Test", "CI", "Debt"]

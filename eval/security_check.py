@@ -1,16 +1,21 @@
-import csv
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
-import tempfile
 from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from eval.quality_check_common import budget_fill_samples
+from eval.quality_check_common import clone_repo as _clone_repo
+from eval.quality_check_common import detect_language as _detect_language_impl
+from eval.quality_check_common import find_files as _find_files_impl
+from eval.quality_check_common import is_test_file as _is_test_impl
+from eval.quality_check_common import read_file as _read
+from eval.quality_check_common import rel_path as _rel
+from eval.quality_check_common import run_git as _run_git
 from llm.credential_redactor import redact_secrets
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
@@ -77,9 +82,7 @@ MANIFEST_NAMES = {
 
 
 def _detect_language(files: list[str]) -> str:
-    py = sum(1 for f in files if os.path.splitext(f)[1] in PYTHON_EXTS)
-    js = sum(1 for f in files if os.path.splitext(f)[1] in JS_EXTS)
-    return "python" if py >= js else "js"
+    return _detect_language_impl(files, PYTHON_EXTS, JS_EXTS)
 
 
 # ---------------------------------------------------------------------------
@@ -296,61 +299,15 @@ SECURITY_HEADER_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
-def _run_git(args: list[str], cwd: str, timeout: int = 30) -> str:
-    try:
-        r = subprocess.run(
-            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout
-        )
-        return r.stdout.strip()
-    except Exception:
-        return ""
-
-
-def _clone_repo(owner: str, repo: str, dest: str, token: str) -> tuple[bool, str]:
-    url = (
-        f"https://{token}@github.com/{owner}/{repo}.git"
-        if token
-        else f"https://github.com/{owner}/{repo}.git"
-    )
-    r = subprocess.run(
-        ["git", "clone", "--depth", "200", url, dest],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return r.returncode == 0, r.stderr.strip()
+_TEST_KEYWORDS = ("test", "spec", "mock", "fixture", "__tests__")
 
 
 def _find_files(root: str, exts: set[str]) -> list[str]:
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for f in filenames:
-            if os.path.splitext(f)[1] in exts:
-                full = os.path.join(dirpath, f)
-                try:
-                    if os.path.getsize(full) <= MAX_FILE_SIZE:
-                        results.append(full)
-                except OSError:
-                    pass
-    return results
-
-
-def _read(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except Exception:
-        return ""
-
-
-def _rel(path: str, root: str) -> str:
-    return os.path.relpath(path, root)
+    return _find_files_impl(root, exts, SKIP_DIRS, max_file_size=MAX_FILE_SIZE)
 
 
 def _is_test(path: str, root: str) -> bool:
-    rel = _rel(path, root).lower()
-    return any(p in rel for p in ["test", "spec", "mock", "fixture", "__tests__"])
+    return _is_test_impl(path, root, _TEST_KEYWORDS)
 
 
 def _is_comment_line(line: str) -> bool:
@@ -941,22 +898,19 @@ def _smart_sample_security(
     char_budget = token_budget * 4
     flagged_paths = _extract_flagged_paths(root, static_details)
 
-    snippets: list[str] = []
+    output: list[str] = []
     total_chars = 0
-    included: set[str] = set()
 
-    # Pass 1: flagged files first — guaranteed inclusion
-    for f in non_test:
-        if f not in flagged_paths:
-            continue
-        chunk = _snippet_for_file(f, root, flagged=True)
-        if not chunk:
-            continue
-        if total_chars + len(chunk) > char_budget:
-            break
-        snippets.append(chunk)
-        total_chars += len(chunk)
-        included.add(f)
+    # Pass 1: flagged files first — guaranteed priority
+    flagged_ordered = [f for f in non_test if f in flagged_paths]
+    text, used, included_list = budget_fill_samples(
+        flagged_ordered,
+        lambda f: _snippet_for_file(f, root, flagged=True),
+        char_budget - total_chars,
+    )
+    output.append(text)
+    total_chars += used
+    included = set(included_list)
 
     # Pass 2: fill remaining budget with scored non-flagged files
     remaining = [f for f in non_test if f not in included]
@@ -991,16 +945,15 @@ def _smart_sample_security(
             scores[f] += 10
             seen_dirs.add(top)
 
-    for f in sorted(remaining, key=lambda x: -scores[x]):
-        chunk = _snippet_for_file(f, root, flagged=False)
-        if not chunk:
-            continue
-        if total_chars + len(chunk) > char_budget:
-            break
-        snippets.append(chunk)
-        total_chars += len(chunk)
+    ordered_remaining = sorted(remaining, key=lambda x: -scores[x])
+    text2, _, _ = budget_fill_samples(
+        ordered_remaining,
+        lambda f: _snippet_for_file(f, root, flagged=False),
+        char_budget - total_chars,
+    )
+    output.append(text2)
 
-    return "".join(snippets)
+    return "".join(output)
 
 
 # ---------------------------------------------------------------------------

@@ -366,34 +366,6 @@ Respond with ONLY this JSON (no markdown, no extra text):
 """
 
 
-F2P_P2P_CHECK_PROMPT = """Analyze if the test changes include both F2P (Fail-to-Pass) and P2P (Pass-to-Pass) tests.
-
-**F2P tests**: NEW tests that would FAIL before the fix and PASS after. They directly test the bug/feature being fixed.
-**P2P tests**: EXISTING tests that PASS both before and after the fix. They ensure no regressions. These are tests that existed before and still pass, or modifications to existing tests.
-
-## Source Code Changes:
-{src_diff}
-
-## Test Changes:
-{test_diff}
-
-IMPORTANT:
-- has_f2p MUST be false if estimated_f2p_tests is 0
-- has_p2p MUST be false if estimated_p2p_tests is 0
-- Be strict: if no clear evidence, set to false
-
-Respond with ONLY this JSON:
-{{
-  "has_f2p": <true ONLY if estimated_f2p_tests > 0>,
-  "has_p2p": <true ONLY if estimated_p2p_tests > 0>,
-  "estimated_f2p_tests": <number of F2P tests, 0 if none>,
-  "estimated_p2p_tests": <number of P2P tests, 0 if none>,
-  "f2p_evidence": "<brief description or 'none found'>",
-  "p2p_evidence": "<brief description or 'none found'>"
-}}
-"""
-
-
 INFER_PROBLEM_PROMPT = """Analyze this code change and infer the problem statement.
 
 **REJECT if:**
@@ -504,51 +476,6 @@ class QualityEvaluator:
                 or os.environ.get("OPENAI_API_KEY", "")
             )
         return ""
-
-    def check_f2p_p2p(
-        self, src_diff: str, test_diff: str
-    ) -> Tuple[bool, str, Optional[dict]]:
-        if not test_diff or not test_diff.strip():
-            return False, "No test changes found", None
-
-        prompt = F2P_P2P_CHECK_PROMPT.format(
-            src_diff=self._truncate_diff(src_diff, self.max_diff_lines // 2)
-            or "(No source changes)",
-            test_diff=self._truncate_diff(test_diff, self.max_diff_lines // 2),
-        )
-
-        data = self._parse_json_response(self._call_llm(prompt))
-        if not data:
-            return False, "Failed to analyze F2P/P2P tests", None
-
-        f2p_evidence = data.get("f2p_evidence", "")
-        p2p_evidence = data.get("p2p_evidence", "")
-        estimated_f2p = data.get("estimated_f2p_tests", 0)
-        estimated_p2p = data.get("estimated_p2p_tests", 0)
-
-        # Cross-validate: override boolean if estimated count is 0
-        has_f2p = data.get("has_f2p", False) and estimated_f2p > 0
-        has_p2p = data.get("has_p2p", False) and estimated_p2p > 0
-
-        stats = {
-            "estimated_f2p_tests": estimated_f2p,
-            "estimated_p2p_tests": estimated_p2p,
-            "f2p_evidence": f2p_evidence,
-            "p2p_evidence": p2p_evidence,
-        }
-
-        if not has_f2p and not has_p2p:
-            return (
-                False,
-                f"No F2P or P2P tests detected. F2P: {f2p_evidence}, P2P: {p2p_evidence}",
-                None,
-            )
-        if not has_f2p:
-            return False, f"No F2P tests detected: {f2p_evidence}", None
-        if not has_p2p:
-            return False, f"No P2P tests detected: {p2p_evidence}", None
-
-        return True, "", stats
 
     def evaluate_candidate(
         self,

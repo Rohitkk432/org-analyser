@@ -1,16 +1,20 @@
-import csv
 import json
 import os
 import re
 import shutil
-import subprocess
-import sys
-import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from eval.quality_check_common import budget_fill_samples
+from eval.quality_check_common import clone_repo as _clone_repo
+from eval.quality_check_common import detect_language as _detect_language_impl
+from eval.quality_check_common import find_files as _find_files_impl
+from eval.quality_check_common import is_test_file as _is_test_impl
+from eval.quality_check_common import read_file as _read
+from eval.quality_check_common import rel_path as _rel
+from eval.quality_check_common import run_git as _run_git
 from llm.credential_redactor import redact_secrets
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
@@ -89,73 +93,27 @@ def _is_toolgen(filepath: str) -> bool:
     return any(re.search(pat, normalized) for pat in TOOLGEN_FILE_PATTERNS)
 
 
+_TEST_KEYWORDS = ("test", "spec", "__tests__")
+
+
 def _find_files(
     root: str, extensions: list[str], skip_toolgen: bool = True
 ) -> list[str]:
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        for f in filenames:
-            if any(f.endswith(ext) for ext in extensions):
-                full = os.path.join(dirpath, f)
-                if skip_toolgen and _is_toolgen(os.path.relpath(full, root)):
-                    continue
-                results.append(full)
-    return results
-
-
-def _read(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except Exception:
-        return ""
-
-
-def _rel(path: str, root: str) -> str:
-    return os.path.relpath(path, root)
+    return _find_files_impl(
+        root,
+        set(extensions),
+        EXCLUDE_DIRS,
+        skip_toolgen_fn=_is_toolgen if skip_toolgen else None,
+    )
 
 
 def _is_test(path: str, root: str) -> bool:
-    rel = _rel(path, root).lower()
-    return any(p in rel for p in ["test", "spec", "__tests__"])
+    return _is_test_impl(path, root, _TEST_KEYWORDS)
 
 
 def _detect_language(files: list[str]) -> str:
     """Return dominant language: 'python' or 'js'."""
-    py = sum(1 for f in files if os.path.splitext(f)[1] in PY_EXTS)
-    js = sum(1 for f in files if os.path.splitext(f)[1] in JS_EXTS)
-    return "python" if py >= js else "js"
-
-
-# ---------------------------------------------------------------------------
-# Clone
-# ---------------------------------------------------------------------------
-
-
-def _clone_repo(owner: str, repo: str, dest: str, token: str) -> tuple[bool, str]:
-    url = (
-        f"https://{token}@github.com/{owner}/{repo}.git"
-        if token
-        else f"https://github.com/{owner}/{repo}.git"
-    )
-    r = subprocess.run(
-        ["git", "clone", "--depth", "200", url, dest],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return r.returncode == 0, r.stderr.strip() if r.returncode != 0 else ""
-
-
-def _run_git(args: list[str], cwd: str) -> str:
-    try:
-        r = subprocess.run(
-            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=30
-        )
-        return r.stdout.strip()
-    except Exception:
-        return ""
+    return _detect_language_impl(files, PY_EXTS, JS_EXTS)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,33 +1021,33 @@ def _smart_sample_vibe(
     char_budget = token_budget * 4
     flagged_paths = _extract_flagged_paths(root, criteria_results)
 
-    snippets: list[str] = []
-    total_chars = 0
-    included: set[str] = set()
-
-    def _add_snippet(f: str, flagged: bool, max_lines: int = 60) -> bool:
-        nonlocal total_chars
+    def _snippet(f: str, flagged: bool, max_lines: int) -> str:
         content = _read(f)
         if not content.strip():
-            return False
+            return ""
         lines = content.split("\n")[:max_lines]
         tag = " [FLAGGED]" if flagged else ""
-        chunk = (
+        return (
             f"\n--- {_rel(f, root)}{tag} ---\n"
             + "\n".join(f"{i + 1}: {l}" for i, l in enumerate(lines))
             + "\n"
         )
-        if total_chars + len(chunk) > char_budget:
-            return False
-        snippets.append(chunk)
-        total_chars += len(chunk)
-        included.add(f)
-        return True
 
-    # Pass 1: flagged files
-    for f in non_test:
-        if f in flagged_paths:
-            _add_snippet(f, flagged=True, max_lines=80)
+    output: list[str] = []
+    total_chars = 0
+
+    # Pass 1: flagged files -- every flagged file is attempted; one that
+    # doesn't fit is skipped rather than treated as budget-exhausted.
+    flagged_ordered = [f for f in non_test if f in flagged_paths]
+    text, used, included_list = budget_fill_samples(
+        flagged_ordered,
+        lambda f: _snippet(f, True, 80),
+        char_budget - total_chars,
+        break_on_overflow=False,
+    )
+    output.append(text)
+    total_chars += used
+    included = set(included_list)
 
     # Pass 2: scored non-flagged files
     scores: dict[str, int] = defaultdict(int)
@@ -1114,28 +1072,34 @@ def _smart_sample_vibe(
 
     seen_dirs: set[str] = set()
     for f in sorted(remaining, key=lambda x: -scores[x]):
-        parts = _rel(f, root).split(os.sep)
-        top = parts[0] if len(parts) > 1 else "__root__"
+        path_parts = _rel(f, root).split(os.sep)
+        top = path_parts[0] if len(path_parts) > 1 else "__root__"
         if top not in seen_dirs:
             scores[f] += 10
             seen_dirs.add(top)
 
-    for f in sorted(remaining, key=lambda x: -scores[x]):
-        if not _add_snippet(f, flagged=False):
-            break
+    ordered_remaining = sorted(remaining, key=lambda x: -scores[x])
+    text2, used2, _ = budget_fill_samples(
+        ordered_remaining, lambda f: _snippet(f, False, 60), char_budget - total_chars
+    )
+    output.append(text2)
+    total_chars += used2
 
     # Add markdown docs (documentation criterion needs them)
-    for md in _find_files(root, [".md"])[:3]:
+    def _md_snippet(md: str) -> str:
         content = _read(md)
         if content.count("\n") < 3:
-            continue
+            return ""
         lines = content.split("\n")[:30]
-        chunk = f"\n--- {_rel(md, root)} (markdown) ---\n" + "\n".join(lines) + "\n"
-        if total_chars + len(chunk) <= char_budget:
-            snippets.append(chunk)
-            total_chars += len(chunk)
+        return f"\n--- {_rel(md, root)} (markdown) ---\n" + "\n".join(lines) + "\n"
 
-    return "".join(snippets)
+    md_files = _find_files(root, [".md"])[:3]
+    text3, _, _ = budget_fill_samples(
+        md_files, _md_snippet, char_budget - total_chars, break_on_overflow=False
+    )
+    output.append(text3)
+
+    return "".join(output)
 
 
 # ---------------------------------------------------------------------------

@@ -852,6 +852,8 @@ class RepoAnalyzer:
         self.owner = owner
         self.repo_name_github = repo_name
         self.platform_client = platform_client
+        self._files_cache: Optional[List[Path]] = None
+        self._history_cache: Optional[Dict[str, Any]] = None
 
     def analyze(self) -> RepoMetrics:
         """Run full repository analysis."""
@@ -986,7 +988,13 @@ class RepoAnalyzer:
         )
 
     def _get_all_files(self) -> List[Path]:
-        """Get all files in repository."""
+        """Get all files in repository (cached -- called from both analyze() and
+        evaluate()'s later health-check pass against the same, unchanging clone)."""
+        if self._files_cache is None:
+            self._files_cache = self._get_all_files_uncached()
+        return self._files_cache
+
+    def _get_all_files_uncached(self) -> List[Path]:
         files = []
         if self.is_git_repo:
             try:
@@ -1525,8 +1533,6 @@ class RepoAnalyzer:
             )
         elif issue_refs > 5:
             score += 10
-            # strengths.append(
-            #     f"Some issue tracking ({issue_refs} commits reference issues)")
         elif issue_refs > 0:
             score += 5
         else:
@@ -1552,7 +1558,12 @@ class RepoAnalyzer:
         }
 
     def _analyze_git_history(self) -> Dict[str, Any]:
-        """Analyze git history."""
+        """Analyze git history (cached -- see _get_all_files)."""
+        if self._history_cache is None:
+            self._history_cache = self._analyze_git_history_uncached()
+        return self._history_cache
+
+    def _analyze_git_history_uncached(self) -> Dict[str, Any]:
         metrics = {}
         try:
             result = subprocess.run(
@@ -1911,6 +1922,12 @@ class RepoAnalyzer:
             return None
 
     def _analyze_svn_history(self) -> Dict[str, Any]:
+        """Analyze svn history (cached -- see _get_all_files)."""
+        if self._history_cache is None:
+            self._history_cache = self._analyze_svn_history_uncached()
+        return self._history_cache
+
+    def _analyze_svn_history_uncached(self) -> Dict[str, Any]:
         """Analyze Subversion history via `svn log --xml -v` (working copy)."""
         metrics: Dict[str, Any] = {}
         try:
@@ -3025,8 +3042,9 @@ class RepoEvaluator:
 
         pr_analysis = self._run_pr_rubrics(pr_analysis, language_config)
 
-        # Repo health checks
-        files = repo_analyzer._get_all_files()
+        # Repo health checks -- files/git_metrics come back from RepoAnalyzer's
+        # per-instance cache (already computed in .analyze() above), and
+        # comment_density likewise reuses that same analyze() pass.
         if repo_analyzer.is_git_repo:
             git_metrics = repo_analyzer._analyze_git_history()
         elif repo_analyzer.is_svn_repo:
@@ -3034,7 +3052,7 @@ class RepoEvaluator:
         else:
             git_metrics = {}
         readme_metrics = _find_readme_metrics(Path(self.repo_path))
-        comment_metrics = _estimate_comment_density(files)
+        comment_metrics = {"comment_density": repo_metrics.comment_density}
         process_health = compute_process_health_checks(
             repo_metrics=repo_metrics,
             pr_analysis=pr_analysis,
@@ -3393,8 +3411,6 @@ def print_report(report: AnalysisReport):
     print(f"Repository: {report.repo_full_name}")
     print(f"Language: {report.repo_metrics.primary_language}")
 
-    # print(f"Overall Score: {report.overall_score}/100")
-    # print(f"Recommendation: {report.recommendation}\n")
     print()
 
     print("--- Repository Metrics ---")
@@ -3462,26 +3478,6 @@ def print_report(report: AnalysisReport):
     if report.repo_metrics.ai_risk_signals:
         print(f"AI/vibe signals: {', '.join(report.repo_metrics.ai_risk_signals)}")
 
-    # if report.repo_metrics.process_health_summary:
-    #     summary = report.repo_metrics.process_health_summary
-    #     print(
-    #         f"\nRepository health checks: {summary.get('passed_count', 0)}/{summary.get('total_count', 0)} "
-    #         f"passed ({summary.get('pass_rate', 0)*100:.1f}%)"
-    #     )
-    # if report.repo_metrics.process_health_checks:
-    #     print("Repository health signals:")
-    #     ordered_keys = sorted(report.repo_metrics.process_health_checks.keys())
-    #     for key in ordered_keys:
-    #         check = report.repo_metrics.process_health_checks.get(key, {})
-    #         description = REPO_HEALTH_DESCRIPTIONS.get(key)
-    #         label = f"{key} ({description})" if description else key
-    #         print(f"  - {label}: {check.get('value')}")
-    #         # if "passed" in check:
-    #         #     passed = "✅" if check.get("passed") else "❌"
-    #         #     print(f"  {passed} {label}: {check.get('value')}")
-    #         # else:
-    #         #     print(f"  - {label}: {check.get('value')}")
-
     print(f"\n--- PR Analysis ---")
     print(f"Total PRs Analyzed: {report.pr_analysis.total_prs}")
     print(f"Passed First Filters PRs: {len(report.pr_analysis.accepted_prs)}")
@@ -3525,20 +3521,6 @@ def print_report(report: AnalysisReport):
     if report.pr_analysis.feature_accepted_prs:
         print(f"\n--- Feature PRs ---")
         print(f"Feature PRs: {report.pr_analysis.feature_accepted}")
-        # for pr in report.pr_analysis.feature_accepted_prs:
-        #     signals = ', '.join(pr.get('feature_signals', []))
-        #     print(
-        #         f"  - {pr['title']} (#{pr['number']}) [score={pr.get('feature_score', '?')}, {signals}]")
-        # if report.pr_analysis.feature_rejection_breakdown:
-        #     print(f"\nFeature Rejection Breakdown:")
-        #     sorted_rejections = sorted(
-        #         report.pr_analysis.feature_rejection_breakdown.items(),
-        #         key=lambda x: x[1]['count'],
-        #         reverse=True
-        #     )
-        #     for filter_name, stats in sorted_rejections:
-        #         print(
-        #             f" {filter_name}: {stats['count']} ({stats['percentage']}%)")
 
 
 def to_json(report: AnalysisReport) -> dict:
@@ -3638,8 +3620,6 @@ def to_json(report: AnalysisReport) -> dict:
     result = {
         "repo_name": report.repo_name,
         "repo_full_name": report.repo_full_name,
-        # 'overall_score': report.overall_score,
-        # 'recommendation': report.recommendation,
         "repo_metrics": repo_metrics_out,
         "pr_analysis": {
             "total_prs": report.pr_analysis.total_prs,
@@ -3653,20 +3633,12 @@ def to_json(report: AnalysisReport) -> dict:
             "pr_last_date": report.pr_analysis.pr_last_date,
             "pr_spread_days": report.pr_analysis.pr_spread_days,
             "pr_unique_dates_count": report.pr_analysis.pr_unique_dates_count,
-            # 'rejection_breakdown': report.pr_analysis.rejection_breakdown,
         },
     }
 
-    # Excluded from output format (kept in internal logic):
-    # repo_metrics_out['test_file_ratio'] = repo_metrics_json.get('test_file_ratio')
-    # repo_metrics_out['readiness_score'] = repo_metrics_json.get('readiness_score')
-    # repo_metrics_out['test_coverage_percentage'] = repo_metrics_json.get('test_coverage_percentage')
-    # repo_metrics_out['recommendation'] = repo_metrics_json.get('recommendation')
-    # repo_metrics_out['strengths'] = repo_metrics_json.get('strengths')
-    # repo_metrics_out['weaknesses'] = repo_metrics_json.get('weaknesses')
-    # repo_metrics_out['commit_spread_days'] = repo_metrics_json.get('commit_spread_days')
-    # repo_metrics_out['process_health_checks'] = repo_metrics_json.get('process_health_checks')
-    # repo_metrics_out['process_health_summary'] = repo_metrics_json.get('process_health_summary')
+    # test_file_ratio/readiness_score/test_coverage_percentage/recommendation/
+    # strengths/weaknesses/commit_spread_days/process_health_checks/
+    # process_health_summary are kept in internal logic but excluded here.
 
     if report.pr_analysis.f2p_results:
         result["pr_analysis"]["f2p_results"] = report.pr_analysis.f2p_results
@@ -3685,12 +3657,10 @@ def to_json(report: AnalysisReport) -> dict:
                     "url": pr.get("url"),
                     "baseRefOid": pr.get("baseRefOid"),
                     "headRefOid": pr.get("headRefOid"),
-                    # 'feature_score': pr.get('feature_score'),
                     "feature_signals": pr.get("feature_signals"),
                 }
                 for pr in report.pr_analysis.feature_accepted_prs
             ],
-            # 'rejection_breakdown': report.pr_analysis.feature_rejection_breakdown,
         }
 
     result["pr_rubrics"] = report.pr_analysis.pr_rubrics or []
