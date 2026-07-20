@@ -154,6 +154,9 @@ sys.path.insert(0, str(CODING))
 from analysis.merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
+    count_bitbucket_merged,
+    count_github_merged,
+    count_gitlab_merged,
     export_bitbucket_repos,
     export_bitbucket_workspace,
     export_github_org,
@@ -1223,9 +1226,41 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     return True, f"eval-kit ok -> {out_json}"
 
 
+def _known_merged_count(entry: RepoEntry, ctx: RunContext) -> int | None:
+    """The real merged-PR count from the platform API, for repo-analyzer's
+    --known-merged-count -- its own git-history heuristic (--provider local)
+    is a floor estimate that can be wildly off (squash/rebase merges leave
+    no trace; long-lived branches merged outside any PR/MR inflate it).
+    One cheap, already-proven-safe API call (same pattern codebase-profiler
+    uses for its own PR-count column). Returns None (no override) for local
+    checkouts or on any lookup failure -- the heuristic stays as a fallback."""
+    if entry.is_local:
+        return None
+    try:
+        if entry.platform == "github":
+            token = ctx.tokens.get(ctx.github_token_name, "")
+            if not token:
+                return None
+            return count_github_merged(token, entry.full_name, ctx.github_host, None, None)
+        if entry.platform == "gitlab":
+            token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+            if not token:
+                return None
+            return count_gitlab_merged(token, entry.full_name, ctx.gitlab_host, None, None)
+        if entry.platform == "bitbucket":
+            token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+            if not token:
+                return None
+            username = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "")
+            return count_bitbucket_merged(token, entry.full_name, username, None, None)
+    except Exception:
+        return None
+    return None
+
+
 def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[bool, str]:
     """LLM-usage / training-data-quality / CI report, run against the local
-    clone (no extra API calls — same clone the other phases already use)."""
+    clone (no extra clone -- same clone the other phases already use)."""
     out_dir = ctx.repo_analyzer_dir / entry.batch_org / entry.short_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / f"{entry.short_name}.csv"
@@ -1236,6 +1271,9 @@ def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tu
         "--name", entry.full_name,
         "--output", str(out_csv),
     ]
+    known_merged = _known_merged_count(entry, ctx)
+    if known_merged is not None:
+        args += ["--known-merged-count", str(known_merged)]
     code, out, err = run_module(
         "analysis.repo_analyzer",
         args,
