@@ -4057,13 +4057,13 @@ def main():
         type=str,
         choices=("gemini", "openai"),
         default="openai",
-        help="LLM provider for PR rubrics: openai (OPENAI_API_KEY, default model gpt-5.1) or gemini (GEMINI_API_KEY)",
+        help="LLM provider for PR rubrics: openai (OPENAI_API_KEY, default model gpt-4o-mini) or gemini (GEMINI_API_KEY)",
     )
     parser.add_argument(
         "--taxonomy-model",
         type=str,
-        default=os.environ.get("TAXONOMY_MODEL", "gpt-4o"),
-        help="Model for taxonomy classification (default: gpt-4o or TAXONOMY_MODEL env)",
+        default=os.environ.get("TAXONOMY_MODEL", "gpt-4o-mini"),
+        help="Model for taxonomy classification (default: gpt-4o-mini or TAXONOMY_MODEL env)",
     )
     parser.add_argument(
         "--taxonomy-base-url",

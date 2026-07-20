@@ -326,7 +326,7 @@ def run_taxonomy_for_accepted_prs(
     primary_language: str,
     get_patch: Callable[[dict[str, Any]], str | None],
     *,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
     base_url: str = "https://api.openai.com/v1",
     skip_taxonomy: bool = False,
     pr_number: int | None = None,

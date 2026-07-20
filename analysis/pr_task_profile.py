@@ -55,7 +55,7 @@ Examples
 --------
     pr-task-profile --repo your-org/example-repo
     pr-task-profile --repo owner/a,owner/b
-    pr-task-profile --org your-org --model gpt-4o
+    pr-task-profile --org your-org --model gpt-4o-mini
     pr-task-profile --user octocat --no-forks
 
 --------------------------------------------------------------------------------

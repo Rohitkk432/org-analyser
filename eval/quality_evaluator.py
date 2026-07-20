@@ -402,7 +402,7 @@ Respond with ONLY JSON (use "This change" not "This commit/PR" in rejection_reas
 
 
 # OpenAI Chat Completions model for rubric scoring (alias or snapshot id).
-DEFAULT_OPENAI_MODEL = "gpt-5.1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
 @dataclass

@@ -125,7 +125,7 @@ class TaxonomyClassifier:
         self,
         api_key: str | None = None,
         base_url: str = "https://api.openai.com/v1",
-        model: str = "gpt-4o",
+        model: str = "gpt-4o-mini",
         taxonomy_path: str | Path | None = None,
         concurrency: int = 32,
     ):

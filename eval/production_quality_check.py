@@ -48,7 +48,7 @@ from llm.credential_redactor import redact_secrets
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 # ---------------------------------------------------------------------------
 # Constants
