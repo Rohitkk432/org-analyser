@@ -2914,10 +2914,7 @@ def run_sanity_checks(
 
     check(f"list repos ({ctx.platform}:{ctx.target})", _check_discovery)
 
-    def _check_clone_auth() -> str:
-        if not entries:
-            raise RuntimeError("skipped: repo listing failed above")
-        sample = entries[0]
+    def _try_clone_auth(sample: RepoEntry) -> str:
         if sample.is_local:
             return f"local checkout: {sample.local_path}"
         url = clone_url(sample, ctx.tokens, ctx)
@@ -2946,6 +2943,24 @@ def run_sanity_checks(
         if proc.returncode != 0:
             raise RuntimeError(scrub_secrets((proc.stderr or proc.stdout or "")[-400:], token))
         return f"git ls-remote ok ({sample.full_name})"
+
+    def _check_clone_auth() -> str:
+        if not entries:
+            raise RuntimeError("skipped: repo listing failed above")
+        # Tolerate individual inaccessible repos -- e.g. a private repo the
+        # token can enumerate via admin:org but not clone. Pass if ANY repo is
+        # reachable, so only a wholly broken token / auth aborts the run. Repos
+        # that fail here are skipped and reported per-repo during the run.
+        last_err = ""
+        for i, sample in enumerate(entries):
+            try:
+                detail = _try_clone_auth(sample)
+                if i:
+                    detail += f" (skipped {i} earlier unreachable repo(s))"
+                return detail
+            except Exception as exc:
+                last_err = f"{sample.full_name}: {exc}"
+        raise RuntimeError(f"no listed repo was cloneable -- last error: {last_err}")
 
     check("git clone auth", _check_clone_auth)
 
