@@ -152,7 +152,25 @@ jobs:
           fi
 
           org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}"
-          org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}" $EXTRA_ARGS
+
+          # org-analyser exits non-zero if ANY repo failed. A run that completed
+          # with some inaccessible/failed repos still produced usable output, so
+          # treat it as success when >=1 repo is ok -- failures are in
+          # FAILURES.md in the artifact. A true abort (preflight/sanity) prints
+          # no "Summary:" line, so ok=0 there and we propagate the failure.
+          set +e
+          org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}" $EXTRA_ARGS 2>&1 | tee "$RUNNER_TEMP/run.log"
+          RUN_RC=${PIPESTATUS[0]}
+          set -e
+          [ "$RUN_RC" -eq 0 ] && exit 0
+
+          OK=$(grep -oE "Summary: [0-9]+ ok" "$RUNNER_TEMP/run.log" | tail -1 | grep -oE "[0-9]+")
+          if [ "${OK:-0}" -gt 0 ]; then
+            echo "::warning::run completed with some failed/skipped repos (see FAILURES.md in the artifact); marking success"
+            exit 0
+          fi
+          echo "::error::run did not complete -- no repos succeeded"
+          exit "$RUN_RC"
 
       - name: Upload report
         if: always()
